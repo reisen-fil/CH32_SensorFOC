@@ -1,0 +1,29 @@
+# MCU Project .gitignore
+
+# Complie output
+*.crf
+*.o
+*.d
+*.iex
+*.axf
+*.htm
+*.hex
+*.lnp   
+*.map
+*.sct
+*.de
+
+# cmake
+build
+pmsm_sensor_md.code-workspace
+.vscode
+
+# vibe-coding
+.agents
+
+# Keil MDK output (Now Contents' next)
+# My_TestBoard/MDK-ARM/JLinkLog.txt
+# My_TestBoard/MDK-ARM/JLinkSettings.ini
+# My_TestBoard/MDK-ARM/My_TestBoard.uvguix.86390
+# My_TestBoard/MDK-ARM/startup_stm32f407xx.lst
+# My_TestBoard/MDK-ARM/DebugConfig/My_TestBoard_STM32F407VETx.dbgconf
