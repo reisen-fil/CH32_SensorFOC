@@ -15,7 +15,7 @@ target_link_libraries(
   ${PROJECT_NAME}
   -Wl,--start-group
   gcc
-  # m   # 用到了三角函数,链接数学库 `libm.a`
+  m     # 用到了三角函数（svc_foc 浮点路径的 sinf/cosf），链接数学库 libm.a
   c
   -Wl,--whole-archive
   -Wl,--no-whole-archive

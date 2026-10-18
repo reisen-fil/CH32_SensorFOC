@@ -6,6 +6,7 @@
 #include "app_system.h"
 
 #include "bsp_led.h"
+#include "bsp_encoder.h"
 #include "bsp_motor_ctrl.h"
 #include "bsp_param_store.h"
 #include "bsp_current_sense.h"
