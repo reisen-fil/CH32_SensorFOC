@@ -1,188 +1,166 @@
 /**
  * @file bsp_current_sense.c
  * @brief 三相电流采样 BSP 实现（双电阻重构：ADC2 注入组 + OPA1/OPA2 内部运放）。
- * @details 结构与本层 bsp_motor_ctrl.c / bsp_analog_sense.c 同构：
- *          - bsp_current_sense_init() 先经 hal_opamp_ops->pf_build 构建 OPA1/OPA2
- *            （运放引脚组 PA5/6/7、PB0、PA3/4、PB1 在此一并配置），再经
- *            hal_adc_ops->pf_build 构建 ADC2 注入组（序号 1 = PB1/OPA1 → U 相，
- *            序号 2 = PA4/OPA2 → V 相，TIM1_TRGO 触发；注入中断线亦在该步配置）；
- *          - bsp_current_sense_calc() 取两路注入值，去零电流偏置后在定点域（Q15
- *            接口宏，1.0 = 1 A）或浮点域（安培）换算，并按 iu + iv + iw = 0 重构 W 相；
- *          - bsp_current_sense_calibrate() 在无电流时把当前两路读数记为新的零电流偏置。
- *          本文件只做"采样值 → 相电流"的换算与重构，不含任何控制算法。
- *          电流重构方式为**双电阻**：两只内部运放分别放大 U/V 相分流电阻上的电压，
- *          输出直接进 ADC2 注入组，故三相电流无需按扇区选择采样时刻。
+ * @details 相序相关数据统一按 bsp_current_sense_phase_enum 数组访问。calc() 只完成：
+ *          ADC 读取 → 偏置扣除 → 基于 ADC 满量程的电流标幺化 → W 相重构；实际电流
+ *          （mA）在 get_current() 中按满量程电流换算。Q 路径保存 Q1.15（-32768~32767），
+ *          浮点路径保存 -1.0~1.0 的标幺小数值。
  */
 
-/* 
-    待测项：
-    1、ADC注入组触发时刻（完成）
-    2、电流采样转换值验证（待顶层FOC构建完成后进行验证）
+/*
+    待测项:
+    1、ADC注入组触发时刻(完成)
+    2、电流采样转换值验证(待顶层FOC构建完成后进行验证)
 
 */
-
+ 
 #include "bsp_current_sense.h"
+#include "bsp_motor_ctrl.h"
+
 #include <stddef.h>
+#include <stdint.h>
+#include <string.h>
 
-/* ==========================================================================
- * 板级常量与配置
- * ========================================================================== */
-
-/** @brief 相分流电阻（µΩ）：示例 1 mΩ，请按实际板子填写。 */
 #define BSP_CURRENT_SENSE_SHUNT_MICRO_OHM     (1000U)
-
-/** @brief 内部运放增益（×1000）：示例 10 倍，请按实际板子填写。 */
-#define BSP_CURRENT_SENSE_GAIN_MILLI          (7333)
-
-/** @brief ADC 参考电压（mV）与满量程计数（12 位）。 */
+#define BSP_CURRENT_SENSE_GAIN_MILLI          (7333U)
 #define BSP_CURRENT_SENSE_ADC_VREF_MV         (3300U)
 #define BSP_CURRENT_SENSE_ADC_FULL_SCALE      (4095U)
-
-/**
- * @brief 两相零电流偏置（ADC 计数）。
- * @note 上电初值为运放静态工作点（约 1/2 参考电压）对应的计数；现场可用
- *       bsp_current_sense_calibrate() 在电机无电流时重新标定并覆盖。
- */
 #define BSP_CURRENT_SENSE_OFFSET_RAW_U        (2048)
 #define BSP_CURRENT_SENSE_OFFSET_RAW_V        (2048)
-
-/**
- * @brief 两相在 ADC 注入序列中的序号（HAL 侧 1 起始）。
- * @note 由 hal_adc.c 的注入通道表决定：序号 1 = PB1 = OPA1 输出 = U 相，
- *       序号 2 = PA4 = OPA2 输出 = V 相。
- */
 #define BSP_CURRENT_SENSE_INJECTED_RANK_U     (3U)
 #define BSP_CURRENT_SENSE_INJECTED_RANK_V     (4U)
 
 /**
- * @brief 定点换算约定：运算全部经 platform_ch32v203.h 暴露的 Q15 接口宏完成，量纲为安培。
- * @details 三段式：
- *          1) 初始化用 PLAT_IQ() 把"每计数对应的电流"定点化：K = I_fs / ADC 满量程
- *             （Q15：1.0 = 1 A）；
- *          2) 换算用 PLAT_IQ_MPY_I32(K, Δcount)（Q15 × 整数 → Q15）直接得到定点安培值
- *             ——整数乘既无截断误差，也不依赖库内 DIV_FAST 快速除法的精度与 |A|<|B| 限制；
- *          3) 反向转换用 PLAT_IQ()（float → 定点）/ PLAT_IQ_TO_FLOAT()（定点 → float）。
- * @note 不再使用标幺（1.0 = 满量程电流）形式；Q15 为 32 位容器，可表示 ±65535 A。
+ * @brief 电流采样最小有效窗口，单位为 TIM1 计数。
+ * @details 只有 PWM 低电平持续计数大于该值时，ADC 采样才认为避开了开关瞬态；
+ *          具体 period 与 PWM 模式取自 hal_tim_motor.config（对应 hal_tim.c 的
+ *          s_tim_motor_config）。
  */
+#define BSP_CURRENT_SENSE_SAMPLE_WINDOW_COUNT (100U)
 
-/**
- * @brief 板级三相电流采样配置表。
- * @note 计算数据类型取 32 位定点（PLAT_IQ_*，Q15，量纲为安培：1.0 = 1 A），若希望结果
- *       直接是浮点安培值，把 data_type 改为 bsp_current_sense_data_type_float 即可
- *       （两条路径共用同一张表，结果量纲一致）。
- *       电流重构方式固定为双电阻。
- */
+/** @brief 当前采样窗口有效相位位掩码。 */
+#define BSP_CURRENT_SENSE_VALID_PHASE_U       (0x01U)
+#define BSP_CURRENT_SENSE_VALID_PHASE_V       (0x02U)
+#define BSP_CURRENT_SENSE_VALID_PHASE_W       (0x04U)
+
 static const bsp_current_sense_config_t s_current_sense_config = {
     .data_type = bsp_current_sense_data_type_q,
     .reconstruct = bsp_current_sense_reconstruct_dual_resistor,
-
     .shunt_resistance_micro_ohm = BSP_CURRENT_SENSE_SHUNT_MICRO_OHM,
     .amplifier_gain_milli = BSP_CURRENT_SENSE_GAIN_MILLI,
     .adc_reference_mv = BSP_CURRENT_SENSE_ADC_VREF_MV,
     .adc_full_scale = BSP_CURRENT_SENSE_ADC_FULL_SCALE,
-
-    .offset_raw_u = BSP_CURRENT_SENSE_OFFSET_RAW_U,
-    .offset_raw_v = BSP_CURRENT_SENSE_OFFSET_RAW_V,
-
-    .injected_rank_u = BSP_CURRENT_SENSE_INJECTED_RANK_U,
-    .injected_rank_v = BSP_CURRENT_SENSE_INJECTED_RANK_V,
-
+    .offset_raw = {
+        [bsp_current_sense_phase_u] = BSP_CURRENT_SENSE_OFFSET_RAW_U,
+        [bsp_current_sense_phase_v] = BSP_CURRENT_SENSE_OFFSET_RAW_V,
+        [bsp_current_sense_phase_w] = 0
+    },
+    .injected_rank = {
+        [bsp_current_sense_phase_u] = BSP_CURRENT_SENSE_INJECTED_RANK_U,
+        [bsp_current_sense_phase_v] = BSP_CURRENT_SENSE_INJECTED_RANK_V,
+        [bsp_current_sense_phase_w] = 0
+    },
     .timeout_count = 100000U,
     .p_user_data = NULL
 };
 
-/** @brief 板级三相电流采样对象（单实例，只保存配置与最近一次换算结果）。 */
 bsp_current_sense_t bsp_current_sense_three_phase = {0};
 
-/**
- * @brief 编译期校验：三相序号数必须为 3。
- */
 typedef char bsp_current_sense_phase_check
     [(bsp_current_sense_phase_count == 3) ? 1 : -1];
 
 /**
- * @brief 编译期校验：两相注入序号必须落在 HAL 注入组通道数之内。
- */
-// typedef char bsp_current_sense_rank_check
-//     [((BSP_CURRENT_SENSE_INJECTED_RANK_U <= HAL_ADC_INJECTED_CHANNEL_COUNT) &&
-//       (BSP_CURRENT_SENSE_INJECTED_RANK_V <= HAL_ADC_INJECTED_CHANNEL_COUNT)) ? 1 : -1];
-
-/* ==========================================================================
- * 内部工具
- * ========================================================================== */
-
-/**
- * @brief 校验板级配置是否可用（除数非零、满量程与注入序号合法）。
- * @param p_config 板级配置。
- * @retval true 配置合法。
- * @retval false 配置非法。
+ * @brief 校验电流采样板级配置。
+ * @details 校验分流电阻、运放增益、ADC 参考参数、ADC 满量程以及 U/V 两路注入序号，
+ *          这些字段都会参与除法或硬件通道访问，不能为零。
+ * @param p_config 待校验的电流采样配置。
+ * @return true 表示配置合法；false 表示参数为空或存在零值配置。
  */
 static bool bsp_current_sense_is_config_valid(
     const bsp_current_sense_config_t *p_config)
 {
-    if ((p_config->shunt_resistance_micro_ohm == 0U) ||
+    if ((p_config == NULL) ||
+        (p_config->shunt_resistance_micro_ohm == 0U) ||
         (p_config->amplifier_gain_milli == 0U) ||
         (p_config->adc_reference_mv == 0U) ||
-        (p_config->adc_full_scale == 0U)) {
+        (p_config->adc_full_scale == 0U) ||
+        (p_config->injected_rank[bsp_current_sense_phase_u] == 0U) ||
+        (p_config->injected_rank[bsp_current_sense_phase_v] == 0U)) {
         return false;
     }
-
-    // if ((p_config->injected_rank_u == 0U) || (p_config->injected_rank_v == 0U) ||
-    //     (p_config->injected_rank_u > HAL_ADC_INJECTED_CHANNEL_COUNT) ||
-    //     (p_config->injected_rank_v > HAL_ADC_INJECTED_CHANNEL_COUNT)) {
-    //     return false;
-    // }
 
     return true;
 }
 
 /**
- * @brief 计算满量程电流（A）：V_ref → 运放输入电压 → 分流电阻上的电流。
- * @details 运放输出端电压达到 ADC 参考电压时对应的相电流：
- *          I_fs = (V_ref / 增益) / R_shunt。全过程在浮点域完成，避免整数溢出
- *          （V_ref 以 mV 计、R_shunt 以 µΩ 计时中间量会超出 32 位）。
- * @param p_config 板级配置。
- * @return 满量程电流（A）；参数非法时返回 0。
+ * @brief 计算满量程电流，单位 mA。
+ * @details I_fs(mA) = (V_ref(V) / gain / R_shunt(ohm)) × 1000。
  */
-static float bsp_current_sense_full_scale_current_a(
+static uint32_t bsp_current_sense_full_scale_current_ma(
     const bsp_current_sense_config_t *p_config)
 {
-    float reference_v;
-    float amplifier_input_v;
-    float shunt_ohm;
+    uint32_t reference_gain_scaled_mv;
+    uint32_t amplifier_input_mv;
+    uint32_t current_ma_numerator;
 
-    if ((p_config->amplifier_gain_milli == 0U) ||
+    if ((p_config == NULL) ||
+        (p_config->amplifier_gain_milli == 0U) ||
         (p_config->shunt_resistance_micro_ohm == 0U)) {
-        return 0.0f;
+        return 0U;
     }
 
-    reference_v = (float)p_config->adc_reference_mv / 1000.0f;
-    amplifier_input_v = reference_v /
-                        ((float)p_config->amplifier_gain_milli / 1000.0f);
-    shunt_ohm = (float)p_config->shunt_resistance_micro_ohm / 1000000.0f;
+    /*
+     * 先把参考电压换算成运放输入电压（mV）：
+     * amplifier_input_mv = Vref(mV) × 1000 / gain_milli。
+     * 再用分流电阻换算为 mA：
+     * current_ma = amplifier_input_mv × 1000000 / shunt_micro_ohm。
+     * 分步计算避免大数乘法，所有中间量均为 32 位无符号整数。
+     */
+    reference_gain_scaled_mv =
+        (uint32_t)p_config->adc_reference_mv * 1000U;
+    amplifier_input_mv =
+        (reference_gain_scaled_mv +
+         (p_config->amplifier_gain_milli / 2U)) /
+        p_config->amplifier_gain_milli;
 
-    return amplifier_input_v / shunt_ohm;
+    if (amplifier_input_mv > (0xFFFFFFFFU / 1000000U)) {
+        return 0U;
+    }
+
+    current_ma_numerator = amplifier_input_mv * 1000000U;
+    return (current_ma_numerator +
+            (p_config->shunt_resistance_micro_ohm / 2U)) /
+           p_config->shunt_resistance_micro_ohm;
 }
 
 /**
- * @brief 读取两路注入转换结果。
+ * @brief 读取 ADC 注入组中的 U/V 两相原始计数。
+ * @details 本函数只读取由硬件触发链路产生的最近一次转换结果，不主动触发 ADC；
+ *          U/V 注入序号从配置数组中取得，W 相由双电阻电流约束重构。
  * @param p_object 电流采样对象指针。
- * @param p_raw_u 输出：U 相原始计数。
- * @param p_raw_v 输出：V 相原始计数。
- * @retval bsp_current_sense_ok 操作成功。
- * @retval bsp_current_sense_err_state HAL 函数表拒绝读取。
+ * @param p_raw_u 输出：U 相 ADC 原始计数。
+ * @param p_raw_v 输出：V 相 ADC 原始计数。
+ * @retval bsp_current_sense_ok 读取成功。
+ * @retval bsp_current_sense_err_param 参数为空。
+ * @retval bsp_current_sense_err_state HAL ADC 读取失败。
  */
 static bsp_current_sense_status_enum bsp_current_sense_read_raw(
     bsp_current_sense_t *p_object,
     uint16_t *p_raw_u,
     uint16_t *p_raw_v)
 {
-    if ((hal_adc_ops->pf_get_injected_value(&hal_adc_injected,
-                                            p_object->config.injected_rank_u,
-                                            p_raw_u) != hal_adc_ok) ||
-        (hal_adc_ops->pf_get_injected_value(&hal_adc_injected,
-                                            p_object->config.injected_rank_v,
-                                            p_raw_v) != hal_adc_ok)) {
+    if ((p_object == NULL) || (p_raw_u == NULL) || (p_raw_v == NULL)) {
+        return bsp_current_sense_err_param;
+    }
+
+    if ((hal_adc_ops->pf_get_injected_value(
+             &hal_adc_injected,
+             p_object->config.injected_rank[bsp_current_sense_phase_u],
+             p_raw_u) != hal_adc_ok) ||
+        (hal_adc_ops->pf_get_injected_value(
+             &hal_adc_injected,
+             p_object->config.injected_rank[bsp_current_sense_phase_v],
+             p_raw_v) != hal_adc_ok)) {
         return bsp_current_sense_err_state;
     }
 
@@ -190,60 +168,147 @@ static bsp_current_sense_status_enum bsp_current_sense_read_raw(
 }
 
 /**
- * @brief 按相序号取 Q 格式电流字段地址。
- * @param p_object 电流采样对象指针。
- * @param phase 相序号，取 bsp_current_sense_phase_x。
- * @return 字段地址；相序号越界时返回 NULL。
+ * @brief 按相序统一获取标幺值。
+ * @details 合并原 phase_q_ptr 与 phase_a_ptr：根据 data_type 从对应数组复制到同一个
+ *          联合体输出，不返回临时地址。
  */
-static const PLAT_IQ_TYPE *bsp_current_sense_phase_q_ptr(
+static bsp_current_sense_status_enum bsp_current_sense_get_pu_value(
     const bsp_current_sense_t *p_object,
-    uint8_t phase)
+    uint8_t phase,
+    bsp_current_sense_value_t *p_value)
 {
-    switch (phase) {
-    case (uint8_t)bsp_current_sense_phase_u:
-        return &p_object->current_q_u;
-    case (uint8_t)bsp_current_sense_phase_v:
-        return &p_object->current_q_v;
-    case (uint8_t)bsp_current_sense_phase_w:
-        return &p_object->current_q_w;
-    default:
-        return NULL;
+    if ((p_object == NULL) || (p_value == NULL) ||
+        (phase >= (uint8_t)bsp_current_sense_phase_count)) {
+        return bsp_current_sense_err_param;
     }
+
+    if (p_object->config.data_type == bsp_current_sense_data_type_q) {
+        p_value->q_value = p_object->current_q[phase];
+    } else if (p_object->config.data_type == bsp_current_sense_data_type_float) {
+        p_value->float_value = p_object->current_a[phase];
+    } else {
+        return bsp_current_sense_err_state;
+    }
+
+    return bsp_current_sense_ok;
 }
 
 /**
- * @brief 按相序号取浮点电流字段地址。
- * @param p_object 电流采样对象指针。
- * @param phase 相序号，取 bsp_current_sense_phase_x。
- * @return 字段地址；相序号越界时返回 NULL。
+ * @brief 把 ADC 计数差转换为 Q1.15 电流标幺值。
+ * @details 标幺值定义为 delta / adc_full_scale。PLAT_IQ_DIV() 负责把两个整数按
+ *          GLOBAL_Q=15 的格式进行除法，结果再限幅到 [-1.0, 1.0) 对应的
+ *          [-32768, 32767]，防止满量程正值溢出 Q1.15 正数范围。
+ * @param delta 去偏置后的 ADC 计数差，可为正或负。
+ * @param adc_full_scale ADC 满量程计数。
+ * @return Q1.15 标幺值。
  */
-static const float *bsp_current_sense_phase_a_ptr(
-    const bsp_current_sense_t *p_object,
-    uint8_t phase)
+static PLAT_IQ_TYPE bsp_current_sense_pu_to_q15(int32_t delta,
+                                                  uint16_t adc_full_scale)
 {
-    switch (phase) {
-    case (uint8_t)bsp_current_sense_phase_u:
-        return &p_object->current_a_u;
-    case (uint8_t)bsp_current_sense_phase_v:
-        return &p_object->current_a_v;
-    case (uint8_t)bsp_current_sense_phase_w:
-        return &p_object->current_a_w;
-    default:
-        return NULL;
+    PLAT_IQ_TYPE pu_q;
+    PLAT_IQ_TYPE q_max = (PLAT_IQ_TYPE)(PLAT_IQ(1.0f) - 1);
+    PLAT_IQ_TYPE q_min = PLAT_IQ(-1.0f);
+
+    /* Q 格式：delta 与满量程均作为 Q 格式整数，使用平台除法宏得到 delta/full_scale。 */
+    pu_q = PLAT_IQ_DIV((PLAT_IQ_TYPE)delta,
+                       (PLAT_IQ_TYPE)adc_full_scale);
+
+    if (pu_q > q_max) {
+        pu_q = q_max;
+    } else if (pu_q < q_min) {
+        pu_q = q_min;
     }
+
+    return pu_q;
 }
 
-/* ==========================================================================
- * 对外接口
- * ========================================================================== */
+/**
+ * @brief 把 ADC 计数差转换为浮点电流标幺值。
+ * @details 浮点路径只保存 ADC 基准对应的无量纲小数值，实际 mA 换算延迟到
+ *          bsp_current_sense_get_current()，避免采样计算函数承担物理单位换算。
+ * @param delta 去偏置后的 ADC 计数差，可为正或负。
+ * @param adc_full_scale ADC 满量程计数。
+ * @return 浮点标幺值。
+ */
+static float bsp_current_sense_pu_to_float(int32_t delta, uint16_t adc_full_scale)
+{
+    /* 浮点路径只保留 ADC 基准对应的标幺小数值，不计算实际电流。 */
+    return (float)delta / (float)adc_full_scale;
+}
 
 /**
- * @brief 初始化三相电流采样：构建内部运放与 ADC2 注入组，并注入板级配置。
+ * @brief 计算指定导通占空比对应的 PWM 低电平计数。
+ * @details bsp_motor_ctrl 保存的是导通占空比，PWM1/PWM2 的比较值极性不同：
+ *          PWM1 的低电平计数为 duty，PWM2 的低电平计数为 period - duty。
+ *          中心对齐模式下，比较值和 period 使用同一计数单位，故此处直接比较。
+ * @param p_object 电流采样对象指针（保留参数用于接口语义一致）。
+ * @param duty 导通占空比计数。
+ * @return 当前相在一个 PWM 半周期内可用于采样的低电平计数。
+ */
+static uint16_t bsp_current_sense_get_low_level_count(
+    const bsp_current_sense_t *p_object,
+    uint16_t duty)
+{
+    uint16_t period = hal_tim_motor.config.time_base.period;
+
+    (void)p_object;
+
+    if (duty > period) {
+        duty = period;
+    }
+
+    if (hal_tim_motor.config.pwm.oc_mode == PLAT_TIMER_OC_MODE_PWM1) {
+        return (uint16_t)(period - duty);
+    }
+
+    return duty;
+}
+
+/**
+ * @brief 根据三相导通占空比计算当前 ADC 采样窗口的有效相位位图。
+ * @details 低电平时间严格大于 BSP_CURRENT_SENSE_SAMPLE_WINDOW_COUNT 才置位；
+ *          W 相没有独立 ADC 通道，只有 U/V 两相均有效时才允许使用 W 相重构值。
  * @param p_object 电流采样对象指针。
- * @retval bsp_current_sense_ok 操作成功。
- * @retval bsp_current_sense_err_param 参数无效或板级配置非法。
- * @retval bsp_current_sense_err_unsupported 重构方式不是双电阻。
- * @retval bsp_current_sense_err_state 运放构建或 ADC 注入组构建失败。
+ * @return U/V/W 有效位图，分别为 0x01/0x02/0x04。
+ */
+static uint8_t bsp_current_sense_get_valid_phase_mask(
+    const bsp_current_sense_t *p_object)
+{
+    uint8_t valid_mask = 0U;
+    uint16_t low_level_count_u;
+    uint16_t low_level_count_v;
+
+    low_level_count_u = bsp_current_sense_get_low_level_count(
+        p_object, bsp_motor_ctrl_three_phase.duty_u);
+    low_level_count_v = bsp_current_sense_get_low_level_count(
+        p_object, bsp_motor_ctrl_three_phase.duty_v);
+
+    if (low_level_count_u > BSP_CURRENT_SENSE_SAMPLE_WINDOW_COUNT) {
+        valid_mask = (uint8_t)(valid_mask | BSP_CURRENT_SENSE_VALID_PHASE_U);
+    }
+    if (low_level_count_v > BSP_CURRENT_SENSE_SAMPLE_WINDOW_COUNT) {
+        valid_mask = (uint8_t)(valid_mask | BSP_CURRENT_SENSE_VALID_PHASE_V);
+    }
+    if ((valid_mask & (BSP_CURRENT_SENSE_VALID_PHASE_U |
+                       BSP_CURRENT_SENSE_VALID_PHASE_V)) ==
+        (BSP_CURRENT_SENSE_VALID_PHASE_U |
+         BSP_CURRENT_SENSE_VALID_PHASE_V)) {
+        valid_mask = (uint8_t)(valid_mask | BSP_CURRENT_SENSE_VALID_PHASE_W);
+    }
+
+    return valid_mask;
+}
+
+/**
+ * @brief 初始化三相电流采样对象及其硬件链路。
+ * @details 初始化顺序为：复制板级配置 → 校验双电阻配置 → 构建 OPA1/OPA2 → 构建
+ *          ADC2 注入组 → 计算 mA 满量程 → 清零数组结果 → 进入 ready 状态。
+ *          本函数不执行零电流偏置采样，现场偏置更新由 calibrate() 完成。
+ * @param p_object 电流采样对象指针。
+ * @retval bsp_current_sense_ok 初始化成功。
+ * @retval bsp_current_sense_err_param 参数或板级配置非法。
+ * @retval bsp_current_sense_err_unsupported 当前重构方式未实现。
+ * @retval bsp_current_sense_err_state 运放或 ADC 构建失败。
  */
 bsp_current_sense_status_enum bsp_current_sense_init(bsp_current_sense_t *p_object)
 {
@@ -251,119 +316,120 @@ bsp_current_sense_status_enum bsp_current_sense_init(bsp_current_sense_t *p_obje
         return bsp_current_sense_err_param;
     }
 
-    /* 外设 config 注入：板级配置表整表拷入对象（后续标定直接更新对象内副本） */
+    /* 拷贝板级配置，后续 calibrate() 只修改对象内的偏置副本。 */
     p_object->config = s_current_sense_config;
-
     if (!bsp_current_sense_is_config_valid(&p_object->config)) {
         p_object->state = bsp_current_sense_state_error;
         return bsp_current_sense_err_param;
     }
-
-    /* 单/三电阻重构需要不同采样序列或第三路注入通道，本层暂只实现双电阻 */
-    if (p_object->config.reconstruct !=
-        bsp_current_sense_reconstruct_dual_resistor) {
+    if (p_object->config.reconstruct != bsp_current_sense_reconstruct_dual_resistor) {
         p_object->state = bsp_current_sense_state_error;
         return bsp_current_sense_err_unsupported;
     }
 
-    /* 1) 两只内部运放先建：运放引脚组（PA5/6/7、PB0 浮空，PA3/4、PB1 模拟）在其中配置，
-          注入通道 PB1/PA4 复用该引脚组，故必须先于 ADC 注入组构建 */
-    if ((hal_opamp_ops->pf_build(&hal_opamp_opa1,
-                                hal_opamp_role_opa1) != hal_opamp_ok) ||
-        (hal_opamp_ops->pf_build(&hal_opamp_opa2,
-                                hal_opamp_role_opa2) != hal_opamp_ok)) {
+    /* 必须先构建内部运放：ADC 注入引脚复用了 OPA1/OPA2 输出路径。 */
+    if ((hal_opamp_ops->pf_build(&hal_opamp_opa1, hal_opamp_role_opa1) != hal_opamp_ok) ||
+        (hal_opamp_ops->pf_build(&hal_opamp_opa2, hal_opamp_role_opa2) != hal_opamp_ok)) {
+        p_object->state = bsp_current_sense_state_error;
+        return bsp_current_sense_err_state;
+    }
+    /* 构建 ADC2 注入组；实际转换由外部 TIM1_TRGO 触发。 */
+    if (hal_adc_ops->pf_build(&hal_adc_injected, hal_adc_role_injected) != hal_adc_ok) {
         p_object->state = bsp_current_sense_state_error;
         return bsp_current_sense_err_state;
     }
 
-    /* 2) ADC2 注入组 + TIM1_TRGO 触发（注入中断线亦在该步配置） */
-    if (hal_adc_ops->pf_build(&hal_adc_injected,
-                              hal_adc_role_injected) != hal_adc_ok) {
-        p_object->state = bsp_current_sense_state_error;
-        return bsp_current_sense_err_state;
-    }
+    /* 缓存满量程 mA，get_current() 只做标幺值到实际单位的换算。 */
+    p_object->full_scale_current_ma =
+        bsp_current_sense_full_scale_current_ma(&p_object->config);
 
-    /* 3) 满量程电流（A）：V_ref / 运放增益 / 分流电阻 */
-    p_object->full_scale_current_a =
-        bsp_current_sense_full_scale_current_a(&p_object->config);
-
-    /* 4) 每计数对应的电流（Q15 定点，A/计数）= 满量程电流 ÷ ADC 满量程，经 PLAT_IQ 定点化 */
-    p_object->current_per_count_q =
-        PLAT_IQ(p_object->full_scale_current_a /
-                (float)p_object->config.adc_full_scale);
-
-    /* 5) 清零采样与换算结果 */
-    p_object->raw_u = 0U;
-    p_object->raw_v = 0U;
-    p_object->current_q_u = 0;
-    p_object->current_q_v = 0;
-    p_object->current_q_w = 0;
-    p_object->current_a_u = 0.0f;
-    p_object->current_a_v = 0.0f;
-    p_object->current_a_w = 0.0f;
-
+    /* 初始化数组结果，避免在首次 calc() 前读取到未定义数据。 */
+    (void)memset(p_object->raw, 0, sizeof(p_object->raw));
+    (void)memset(p_object->current_q, 0, sizeof(p_object->current_q));
+    (void)memset(p_object->current_a, 0, sizeof(p_object->current_a));
+    p_object->valid_phase_mask = 0U;
     p_object->state = bsp_current_sense_state_ready;
+
     return bsp_current_sense_ok;
 }
 
 /**
- * @brief 换算一次三相电流（读取注入组结果 → 去偏置 → 换算 → 双电阻重构）。
+ * @brief 读取一次 ADC 并更新三相电流标幺值。
+ * @details 处理链路：
+ *          1) 读取 U/V 两路 ADC 原始计数；
+ *          2) 减去各自零电流偏置，得到有符号计数差；
+ *          3) W 相按 iu + iv + iw = 0 重构；
+ *          4) 按配置将三相计数差转换为 Q1.15 或浮点标幺值。
+ *          本函数不计算实际安培或 mA，实际单位换算集中在 get_current()。
  * @param p_object 电流采样对象指针。
- * @retval bsp_current_sense_ok 操作成功。
- * @retval bsp_current_sense_err_param 参数无效或数据类型非法。
- * @retval bsp_current_sense_err_state 对象未初始化或 HAL 读取注入值失败。
- * @retval bsp_current_sense_err_unsupported 重构方式不是双电阻。
+ * @retval bsp_current_sense_ok 采样和标幺换算成功。
+ * @retval bsp_current_sense_err_param 参数或数据类型非法。
+ * @retval bsp_current_sense_err_state 对象未初始化或 ADC 读取失败。
  */
-
 bsp_current_sense_status_enum bsp_current_sense_calc(bsp_current_sense_t *p_object)
 {
     uint16_t raw_u = 0U;
     uint16_t raw_v = 0U;
-    int32_t delta_u;
-    int32_t delta_v;
+    int32_t delta[bsp_current_sense_phase_count];
+    uint8_t phase;
+    uint8_t valid_phase_mask;
 
     if (p_object == NULL) {
         return bsp_current_sense_err_param;
     }
-
     if (p_object->state == bsp_current_sense_state_reset) {
         return bsp_current_sense_err_state;
     }
-
-    if (bsp_current_sense_read_raw(p_object, &raw_u, &raw_v) !=
-        bsp_current_sense_ok) {
+    if (p_object->config.data_type != bsp_current_sense_data_type_q &&
+        p_object->config.data_type != bsp_current_sense_data_type_float) {
+        p_object->state = bsp_current_sense_state_error;
+        return bsp_current_sense_err_param;
+    }
+    if (bsp_current_sense_read_raw(p_object, &raw_u, &raw_v) != bsp_current_sense_ok) {
         p_object->state = bsp_current_sense_state_error;
         return bsp_current_sense_err_state;
     }
 
-    p_object->raw_u = raw_u;
-    p_object->raw_v = raw_v;
+    /* 根据本次 PWM 占空比和 TIM1 PWM 模式计算 ADC 有效采样窗口。 */
+    valid_phase_mask = bsp_current_sense_get_valid_phase_mask(p_object);
+    p_object->valid_phase_mask = valid_phase_mask;
 
-    /* 去零电流偏置：得到两相的有符号计数差（符号即电流方向） */
-    delta_u = (int32_t)raw_u - p_object->config.offset_raw_u;
-    delta_v = (int32_t)raw_v - p_object->config.offset_raw_v;
+    /* 保存最近一次 U/V 原始采样，便于标定、调试和故障分析。 */
+    p_object->raw[bsp_current_sense_phase_u] = raw_u;
+    p_object->raw[bsp_current_sense_phase_v] = raw_v;
+
+    /* ADC 计数减去静态偏置后，符号表示电流方向。 */
+    delta[bsp_current_sense_phase_u] =
+        (int32_t)raw_u - p_object->config.offset_raw[bsp_current_sense_phase_u];
+    delta[bsp_current_sense_phase_v] =
+        (int32_t)raw_v - p_object->config.offset_raw[bsp_current_sense_phase_v];
+    /* 双电阻重构第三相：iw = -(iu + iv)。 */
+    delta[bsp_current_sense_phase_w] =
+        -(delta[bsp_current_sense_phase_u] + delta[bsp_current_sense_phase_v]);
 
     if (p_object->config.data_type == bsp_current_sense_data_type_q) {
-        /* 定点域（Q15，1.0 = 1 A）：整数计数差 × 每计数电流 → 定点安培值，全程无浮点 */
-        p_object->current_q_u =
-            PLAT_IQ_MPY_I32(p_object->current_per_count_q, (int32_t)delta_u);
-        p_object->current_q_v =
-            PLAT_IQ_MPY_I32(p_object->current_per_count_q, (int32_t)delta_v);
-        /* 双电阻重构：iu + iv + iw = 0（同为 Q15 格式，直接整数相加后取反） */
-        p_object->current_q_w =
-            (PLAT_IQ_TYPE)(-(p_object->current_q_u + p_object->current_q_v));
-    } else if (p_object->config.data_type == bsp_current_sense_data_type_float) {
-        /* 浮点域：计数差 → 安培值 */
-        float scale = p_object->full_scale_current_a /
-                      (float)p_object->config.adc_full_scale;
-
-        p_object->current_a_u = (float)delta_u * scale;
-        p_object->current_a_v = (float)delta_v * scale;
-        /* 双电阻重构：iu + iv + iw = 0 */
-        p_object->current_a_w = -(p_object->current_a_u + p_object->current_a_v);
+        for (phase = 0U; phase < (uint8_t)bsp_current_sense_phase_count; phase++) {
+            if ((valid_phase_mask & (uint8_t)(1U << phase)) != 0U) {
+                /* 低电平窗口满足要求，保留当前相的 Q1.15 标幺电流。 */
+                p_object->current_q[phase] =
+                    (PLAT_IQ_TYPE)bsp_current_sense_pu_to_q15(
+                        delta[phase], p_object->config.adc_full_scale);
+            } else {
+                /* 窗口不足时当前 ADC 结果可能处于开关瞬态，直接置零。 */
+                p_object->current_q[phase] = 0;
+            }
+        }
     } else {
-        p_object->state = bsp_current_sense_state_error;
-        return bsp_current_sense_err_param;
+        for (phase = 0U; phase < (uint8_t)bsp_current_sense_phase_count; phase++) {
+            if ((valid_phase_mask & (uint8_t)(1U << phase)) != 0U) {
+                /* 低电平窗口满足要求，保留当前相的浮点标幺电流。 */
+                p_object->current_a[phase] =
+                    bsp_current_sense_pu_to_float(delta[phase], p_object->config.adc_full_scale);
+            } else {
+                /* 窗口不足时当前 ADC 结果可能处于开关瞬态，直接置零。 */
+                p_object->current_a[phase] = 0.0f;
+            }
+        }
     }
 
     p_object->state = bsp_current_sense_state_running;
@@ -371,11 +437,13 @@ bsp_current_sense_status_enum bsp_current_sense_calc(bsp_current_sense_t *p_obje
 }
 
 /**
- * @brief 零电流偏置标定：把当前两路注入读数记为新的零电流偏置。
+ * @brief 标定 U/V 两相零电流 ADC 偏置。
+ * @details 调用时必须保证电机无电流、PWM 输出已关闭。当前 ADC 注入值被保存到 raw 数组，
+ *          同时覆盖 U/V 配置偏置；W 相没有独立 ADC 通道，其偏置保持为 0，继续由两相重构。
  * @param p_object 电流采样对象指针。
- * @retval bsp_current_sense_ok 操作成功。
- * @retval bsp_current_sense_err_param 参数无效或对象未初始化。
- * @retval bsp_current_sense_err_state HAL 读取注入值失败。
+ * @retval bsp_current_sense_ok 标定成功。
+ * @retval bsp_current_sense_err_param 对象为空或尚未初始化。
+ * @retval bsp_current_sense_err_state ADC 读取失败。
  */
 bsp_current_sense_status_enum bsp_current_sense_calibrate(
     bsp_current_sense_t *p_object)
@@ -383,77 +451,71 @@ bsp_current_sense_status_enum bsp_current_sense_calibrate(
     uint16_t raw_u = 0U;
     uint16_t raw_v = 0U;
 
-    if ((p_object == NULL) ||
-        (p_object->state == bsp_current_sense_state_reset)) {
+    if ((p_object == NULL) || (p_object->state == bsp_current_sense_state_reset)) {
         return bsp_current_sense_err_param;
     }
-
-    if (bsp_current_sense_read_raw(p_object, &raw_u, &raw_v) !=
-        bsp_current_sense_ok) {
+    if (bsp_current_sense_read_raw(p_object, &raw_u, &raw_v) != bsp_current_sense_ok) {
         p_object->state = bsp_current_sense_state_error;
         return bsp_current_sense_err_state;
     }
 
-    p_object->raw_u = raw_u;
-    p_object->raw_v = raw_v;
-    p_object->config.offset_raw_u = (int32_t)raw_u;
-    p_object->config.offset_raw_v = (int32_t)raw_v;
+    /* 保存标定采样值，并将其作为后续 calc() 使用的零电流基准。 */
+    p_object->raw[bsp_current_sense_phase_u] = raw_u;
+    p_object->raw[bsp_current_sense_phase_v] = raw_v;
+    p_object->config.offset_raw[bsp_current_sense_phase_u] = (int32_t)raw_u;
+    p_object->config.offset_raw[bsp_current_sense_phase_v] = (int32_t)raw_v;
 
     return bsp_current_sense_ok;
 }
 
 /**
- * @brief 取某相电流的浮点值（安培）。
- * @details 统一取值出口，按配置的运算类型分两路赋值：
- *          - Q 格式运算：先读取对象的 Q 格式结果，再经 Q15 接口宏 PLAT_IQ_TO_FLOAT()
- *            按 2^15 移位换算（Q15 → float，即数值 ÷ 32768）得到浮点安培值；
- *          - 浮点运算：直接读取浮点结果字段赋值。
+ * @brief 获取指定相的标幺电流及实际 mA 电流。
+ * @details 先通过统一取值函数读取当前相的 Q1.15 或浮点标幺值，再按配置的满量程 mA
+ *          换算实际电流。Q 路径使用 PLAT_IQ_MPY_I32_INT() 取整数部分，浮点路径
+ *          直接转换为 int32_t；两条路径均保持电流方向符号。
  * @param p_object 电流采样对象指针。
- * @param phase 相序号，取 bsp_current_sense_phase_x。
- * @param p_value 输出：相电流（A）。
- * @retval bsp_current_sense_ok 操作成功。
- * @retval bsp_current_sense_err_param 参数无效或相序号越界。
- * @retval bsp_current_sense_err_state 运算类型不受支持。
+ * @param phase 相序号（U/V/W）。
+ * @param p_pu 输出：标幺电流联合体。
+ * @param p_current_ma 输出：实际电流，单位 mA，取整数。
+ * @retval bsp_current_sense_ok 获取成功。
+ * @retval bsp_current_sense_err_param 参数为空或相序号越界。
+ * @retval bsp_current_sense_err_state 数据类型不支持。
  */
 bsp_current_sense_status_enum bsp_current_sense_get_current(
     const bsp_current_sense_t *p_object,
     uint8_t phase,
-    float *p_value)
+    bsp_current_sense_value_t *p_pu,
+    int32_t *p_current_ma)
 {
-    const PLAT_IQ_TYPE *p_q;
-    const float *p_a;
+    bsp_current_sense_status_enum status;
 
-    if ((p_object == NULL) || (p_value == NULL)) {
+    if ((p_object == NULL) || (p_pu == NULL) || (p_current_ma == NULL)) {
         return bsp_current_sense_err_param;
     }
 
+    status = bsp_current_sense_get_pu_value(p_object, phase, p_pu);
+    if (status != bsp_current_sense_ok) {
+        return status;
+    }
+
     if (p_object->config.data_type == bsp_current_sense_data_type_q) {
-        /* Q 格式运算：先读 Q 格式结果，再移位换算成浮点安培值后赋值 */
-        p_q = bsp_current_sense_phase_q_ptr(p_object, phase);
-        if (p_q == NULL) {
-            return bsp_current_sense_err_param;
-        }
-
-        *p_value = PLAT_IQ_TO_FLOAT(*p_q);
-    } else if (p_object->config.data_type == bsp_current_sense_data_type_float) {
-        /* 浮点运算：直接取浮点结果字段赋值 */
-        p_a = bsp_current_sense_phase_a_ptr(p_object, phase);
-        if (p_a == NULL) {
-            return bsp_current_sense_err_param;
-        }
-
-        *p_value = *p_a;
+        /* Q1.15 标幺值 × mA 满量程，直接由平台宏取整数部分。 */
+        *p_current_ma = PLAT_IQ_MPY_I32_INT(
+            p_pu->q_value,
+            (int32_t)p_object->full_scale_current_ma);
     } else {
-        return bsp_current_sense_err_state;
+        /* 浮点标幺值 × mA 满量程，转换为整数即完成取整。 */
+        *p_current_ma = (int32_t)(p_pu->float_value *
+                                  (float)p_object->full_scale_current_ma);
     }
 
     return bsp_current_sense_ok;
 }
 
 /**
- * @brief 查询电流采样对象当前状态。
+ * @brief 查询电流采样对象的生命周期状态。
  * @param p_object 电流采样对象指针。
- * @return 当前对象状态；参数为空时返回 bsp_current_sense_state_error。
+ * @return 当前状态；参数为空时返回 bsp_current_sense_state_error。
  */
 bsp_current_sense_state_enum bsp_current_sense_get_state(
     const bsp_current_sense_t *p_object)
@@ -461,23 +523,19 @@ bsp_current_sense_state_enum bsp_current_sense_get_state(
     if (p_object == NULL) {
         return bsp_current_sense_state_error;
     }
-
     return p_object->state;
 }
 
-/* ==========================================================================
- * BSP 三相电流采样函数表
- * ========================================================================== */
-
-/** @brief BSP 三相电流采样函数表（本文件私有，绑定板级接口）。 */
+/**
+ * @brief 电流采样 BSP 函数表。
+ * @details 统一绑定初始化、采样换算、偏置标定、标幺/mA 读取和状态查询接口。
+ */
 static const bsp_current_sense_ops_t s_bsp_current_sense_ops = {
     .pf_init = bsp_current_sense_init,
     .pf_calc = bsp_current_sense_calc,
     .pf_calibrate = bsp_current_sense_calibrate,
-    // 备用
     .pf_get_current = bsp_current_sense_get_current,
     .pf_get_state = bsp_current_sense_get_state
 };
 
-/** @brief BSP 三相电流采样函数表指针（对外外露，声明于 bsp_current_sense.h）。 */
 const bsp_current_sense_ops_t *const bsp_current_sense_ops = &s_bsp_current_sense_ops;
