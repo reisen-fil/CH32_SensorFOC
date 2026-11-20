@@ -397,7 +397,7 @@ bsp_encoder_status_enum bsp_encoder_mt6701_get_electrical_angle(
 bsp_encoder_status_enum bsp_encoder_mt6701_get_angle_pu(
     const bsp_encoder_t *p_object,
     bsp_encoder_angle_enum angle,
-    float *p_value)
+    bsp_encoder_pu_angle_t *p_value)
 {
     const bsp_encoder_pu_angle_t *p_pu;
     bool need_alignment = false;
@@ -432,7 +432,7 @@ bsp_encoder_status_enum bsp_encoder_mt6701_get_angle_pu(
         return bsp_encoder_err_state;
     }
 
-    *p_value = bsp_encoder_pu_to_float(&p_object->config, p_pu);
+    p_value = p_pu;             // 确认数据获取前置条件没问题后进行写入
 
     return bsp_encoder_ok;
 }

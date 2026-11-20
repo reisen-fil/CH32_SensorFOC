@@ -211,8 +211,8 @@ bsp_analog_sense_status_enum bsp_analog_sense_update(bsp_analog_sense_t *p_objec
         (uint32_t)p_object->config.bus_voltage_divider_den;
 
     /* NTC 温度：查表 + 线性插值 */
-    // raw_ntc = p_object->raw_value[bsp_analog_sense_channel_ntc];
-    // p_object->ntc_temperature_dc = bsp_analog_sense_ntc_to_temperature(raw_ntc);
+    raw_ntc = p_object->raw_value[bsp_analog_sense_channel_ntc];
+    p_object->ntc_temperature_dc = bsp_analog_sense_ntc_to_temperature(raw_ntc);
 
     p_object->state = bsp_analog_sense_state_running;
     return bsp_analog_sense_ok;

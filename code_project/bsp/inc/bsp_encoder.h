@@ -230,7 +230,7 @@ bsp_encoder_status_enum bsp_encoder_mt6701_get_electrical_angle(bsp_encoder_t *p
 bsp_encoder_status_enum bsp_encoder_mt6701_get_angle_pu(
     const bsp_encoder_t *p_object,
     bsp_encoder_angle_enum angle,
-    float *p_value);
+    bsp_encoder_pu_angle_t *p_value);
 
 /**
  * @brief 差分计算机械转速（本函数不采样，用本次与上一次采样的机械角度计数差表示）。
