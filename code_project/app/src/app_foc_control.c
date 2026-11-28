@@ -1,6 +1,6 @@
 /**
  * @file app_foc_control.c
- * @brief 应用层 FOC 控制实现（零点标定 + 开环 Uq 控制）。
+ * @brief 应用层 FOC 控制实现（零点标定 + Q15 d 轴角度强拖）。
  * @details 本文件只保留控制业务：角度积分、零点标定、编码器零点偏置写回。FOC 运算与
  *          三相 PWM 下发全部经服务层函数表 svc_foc_ops：
  *            svc_foc_ops->pf_get_current()      采样电流并刷新 Clarke/Park 观测值
@@ -11,23 +11,19 @@
  *          状态机 + 每拍推进一次"的薄封装。
  *          本文件不做任何 BSP 外设初始化：编码器 / 电流采样 / 三相 PWM 由 app_system 集中
  *          初始化；这里只在标定时直接读编码器、写回零点偏置。
- *          量纲：dq 电压为**伏特**，电角度为**标幺值**（0 ~ 1），电流为安培。
+ *          量纲：dq 电压按服务层基值归一化为标幺值，电角度为 Q15 标幺值。
  */
 #include "app_foc_control.h"
 #include "bsp_encoder.h"
 #include "bsp_current_sense.h"
 #include "hal_gpio.h"
+#include "hal_tim.h"
 
 #include <stddef.h>
 #include <string.h>
 
-/** @brief Q15 标幺角度 1.0 的取模掩码（0 ~ 1 回绕，1.0 = 32768）。 */
-#define APP_FOC_CONTROL_PU_MASK            (0x7FFF)
-
-/** @brief 角度积分换算：Q15 标幺 1.0 的计数；四舍五入所用的半个除数与除数。 */
-#define APP_FOC_CONTROL_PU_ONE_Q           (32768LL)
-#define APP_FOC_CONTROL_ANGLE_ROUND        (500000000LL)
-#define APP_FOC_CONTROL_ANGLE_DIVISOR      (1000000000LL)
+/** @brief Q15 电角度一周的计数值。 */
+#define APP_FOC_CONTROL_ANGLE_PERIOD_Q15   (32768U)
 
 /** @brief 允许的最大采样次数（用于配置合法性检查）。 */
 #define APP_FOC_CONTROL_SAMPLE_COUNT_MAX   (64U)
@@ -37,17 +33,19 @@
 
 /**
  * @brief 应用 FOC 控制板级配置。
- * @note 对齐电压/保持时间、采样次数/间隔与开环 Uq/频率是电气参数的占位值，需按实际电机
- *       实测调整；PWM 满量程、母线电压、运算类型、调制方式在服务层配置表（svc_foc.c）里配置。
+ * @note 对齐电压/保持时间、采样次数/间隔与 d 轴强拖电压/频率是电气参数的占位值，需按实际
+ *       电机实测调整；强拖频率必须为 PWM 开关频率的整数约数。
  */
 static const app_foc_control_config_t s_app_foc_control_config = {
     .encoder_resolution_bits = 14U,
-    .zero_align_voltage_v = 2.0f,
+    .zero_align_voltage_q15 = PLAT_IQ(0.3f),
     .zero_align_time_us = 300000U,
     .zero_align_sample_count = 16U,
     .zero_align_sample_interval_us = 1000U,      /* 采样窗口 = 16 × 1 ms = 16 ms */
-    .open_loop_uq_v = 1.0f,
-    .open_loop_frequency_millihz = 1000,         /* 1 Hz 电频率 */
+    .open_loop_ud_q15 = PLAT_IQ(0.2f),
+    .open_loop_frequency_hz = 1U,       // 1Hz-20Hz
+    .open_loop_adc_irq_count = 0U,
+    .open_loop_angle_step_q15 = 0,
     .p_user_data = NULL
 };
 
@@ -137,43 +135,6 @@ static app_foc_control_status_enum app_foc_control_map_fsm_status(
 }
 
 /**
- * @brief 把 Q15 标幺电角度打包成服务层入参（按运算类型选并集成员）。
- * @param angle_pu_q 标幺电角度（Q15，0 ~ 32767）。
- * @return 服务层角度入参。
- */
-static svc_foc_value_t app_foc_control_make_angle(PLAT_IQ_TYPE angle_pu_q)
-{
-    svc_foc_value_t angle_pu;
-
-    if (svc_foc_motor.config.arithmetic_type == svc_foc_arithmetic_q15) {
-        angle_pu.q_value = angle_pu_q;
-    } else {
-        angle_pu.float_value = PLAT_IQ_TO_FLOAT(angle_pu_q);
-    }
-
-    return angle_pu;
-}
-
-/**
- * @brief 把电压（V）打包成服务层入参（按运算类型选并集成员）。
- * @details 服务层的 dq 电压入参是定点/浮点兼容的并集类型，调用方需按当前运算类型填成员。
- * @param voltage_v 电压（V）。
- * @return 服务层电压入参。
- */
-static svc_foc_value_t app_foc_control_make_voltage(float voltage_v)
-{
-    svc_foc_value_t voltage;
-
-    if (svc_foc_motor.config.arithmetic_type == svc_foc_arithmetic_q15) {
-        voltage.q_value = PLAT_IQ(voltage_v);
-    } else {
-        voltage.float_value = voltage_v;
-    }
-
-    return voltage;
-}
-
-/**
  * @brief 计算两个机械角计数之间的最短弧差（跨 0/单圈计数 边界安全）。
  * @details 结果落在 ±(单圈计数/2] 之内：把差值按单圈计数取模后，超过半圈的一侧折算成
  *          负值。用于多次采样求均值时避免零点位于边界处导致均值跳变。
@@ -212,9 +173,9 @@ static svc_fsm_status_enum app_foc_control_align_enter_energizing(svc_fsm_t *p_f
                                                                   uint32_t elapsed_us)
 {
     app_foc_control_t *p_object = (app_foc_control_t *)p_context;
-    svc_foc_value_t angle_pu;
-    svc_foc_value_t align_voltage_v;
-    svc_foc_value_t zero_voltage_v;
+    svc_foc_value_t angle_pu = {0};
+    svc_foc_value_t align_voltage_q15 = {0};
+    svc_foc_value_t zero_voltage_q15 = {0};
 
     (void)p_fsm;
     (void)elapsed_us;
@@ -227,14 +188,14 @@ static svc_fsm_status_enum app_foc_control_align_enter_energizing(svc_fsm_t *p_f
         return svc_fsm_err_state;
     }
 
-    /* 对齐矢量：电角度 0、Ud = 对齐电压（V）、Uq = 0 */
-    angle_pu = app_foc_control_make_angle(0);
-    align_voltage_v = app_foc_control_make_voltage(p_object->config.zero_align_voltage_v);
-    zero_voltage_v = app_foc_control_make_voltage(0.0f);
+    /* 对齐矢量直接按 Q15 标幺值设置：角度 0、Ud=config、Uq=0。 */
+    angle_pu.q_value = 0;
+    align_voltage_q15.q_value = p_object->config.zero_align_voltage_q15;
+    zero_voltage_q15.q_value = 0;
 
     if (app_foc_control_svc_to_fsm(
-            svc_foc_ops->pf_output_dq_pwm(&svc_foc_motor, align_voltage_v, zero_voltage_v,
-                                          angle_pu)) != svc_fsm_ok) {
+            svc_foc_ops->pf_output_dq_pwm(&svc_foc_motor, align_voltage_q15,
+                                          zero_voltage_q15, angle_pu)) != svc_fsm_ok) {
         return svc_fsm_err_state;
     }
 
@@ -382,8 +343,8 @@ static svc_fsm_status_enum app_foc_control_align_enter_done(svc_fsm_t *p_fsm,
                                                             uint32_t elapsed_us)
 {
     app_foc_control_t *p_object = (app_foc_control_t *)p_context;
-    svc_foc_value_t angle_pu;
-    svc_foc_value_t zero_voltage_v;
+    svc_foc_value_t angle_pu = {0};
+    svc_foc_value_t zero_voltage_q15 = {0};
     int32_t resolution;
     int32_t sample_count;
     int32_t average_counts;
@@ -418,12 +379,12 @@ static svc_fsm_status_enum app_foc_control_align_enter_done(svc_fsm_t *p_fsm,
     /* 刷新零点标定后的机械/电角度及其标幺值 */
     (void)bsp_encoder_mt6701_ops->pf_get_electrical_angle(&bsp_encoder_mt6701);
 
-    /* 撤掉对齐矢量：dq = (0, 0) → 三相占空比回到 50%，线电压为零 */
-    angle_pu = app_foc_control_make_angle(0);
-    zero_voltage_v = app_foc_control_make_voltage(0.0f);
+    /* 撤掉对齐矢量：Q15 dq = (0, 0)，线电压为零。 */
+    angle_pu.q_value = 0;
+    zero_voltage_q15.q_value = 0;
     if (app_foc_control_svc_to_fsm(
-            svc_foc_ops->pf_output_dq_pwm(&svc_foc_motor, zero_voltage_v, zero_voltage_v,
-                                          angle_pu)) != svc_fsm_ok) {
+            svc_foc_ops->pf_output_dq_pwm(&svc_foc_motor, zero_voltage_q15,
+                                          zero_voltage_q15, angle_pu)) != svc_fsm_ok) {
         return svc_fsm_err_state;
     }
 
@@ -471,7 +432,7 @@ static const svc_fsm_config_t s_app_foc_control_align_fsm_config = {
 };
 
 /**
- * @brief 初始化应用 FOC 控制对象：注入配置、缓存编码器分辨率、初始化服务层。
+ * @brief 初始化应用 FOC 控制对象：注入配置、预计算强拖相位步进并初始化服务层。
  * @param p_object 应用 FOC 控制对象指针。
  * @retval app_foc_control_ok 操作成功。
  * @retval app_foc_control_err_param 参数无效或配置非法。
@@ -493,18 +454,35 @@ app_foc_control_status_enum app_foc_control_init(app_foc_control_t *p_object)
         (p_object->config.zero_align_time_us == 0U) ||
         (p_object->config.zero_align_sample_count == 0U) ||
         (p_object->config.zero_align_sample_count > APP_FOC_CONTROL_SAMPLE_COUNT_MAX) ||
-        (p_object->config.zero_align_sample_interval_us == 0U)) {
+        (p_object->config.zero_align_sample_interval_us == 0U) ||
+        (p_object->config.open_loop_frequency_hz == 0U) ||
+        (HAL_TIM_PWM_FREQUENCY_HZ % p_object->config.open_loop_frequency_hz != 0U) ||
+        (p_object->config.open_loop_frequency_hz > HAL_TIM_PWM_FREQUENCY_HZ)) {
         return app_foc_control_err_param;
     }
 
     p_object->encoder_resolution =
         (uint16_t)(1U << p_object->config.encoder_resolution_bits);
 
-    /* 服务层初始化：注入运算配置、PWM 满量程与母线电压，不碰硬件 */
+    /* 服务层初始化：注入运算配置、PWM 满量程与母线电压，不碰硬件。 */
     status = app_foc_control_map_status(svc_foc_ops->pf_init(&svc_foc_motor));
     if (status != app_foc_control_ok) {
         p_object->state = app_foc_control_state_error;
         return status;
+    }
+
+    if (svc_foc_motor.config.arithmetic_type != svc_foc_arithmetic_q15) {
+        return app_foc_control_err_unsupported;
+    }
+
+    p_object->config.open_loop_adc_irq_count = (uint16_t)(
+        HAL_TIM_PWM_FREQUENCY_HZ / p_object->config.open_loop_frequency_hz);
+    p_object->config.open_loop_angle_step_q15 = PLAT_IQ_DIV(
+        PLAT_IQ(1.0f),
+        PLAT_IQ(p_object->config.open_loop_adc_irq_count));
+    if ((p_object->config.open_loop_adc_irq_count == 0U) ||
+        (p_object->config.open_loop_angle_step_q15 == 0)) {
+        return app_foc_control_err_param;
     }
 
     /* 标定状态机在第一次标定时才初始化，保证初始化阶段不会给电机加电压 */
@@ -566,22 +544,20 @@ app_foc_control_status_enum app_foc_control_zero_calibrate(app_foc_control_t *p_
 }
 
 /**
- * @brief 开环 Uq 控制：角度自积分 → 服务层输出电压并下发三相 PWM。
+ * @brief 按 ADC 中断频率推进 Q15 d 轴电角度强拖。
+ * @details 每次 ADC 注入中断调用一次；按 init 预计算的 Q15 步进更新电角度并输出
+ *          Ud、Uq=0 的 d 轴矢量，不依赖编码器零点对齐状态。
  * @param p_object 应用 FOC 控制对象指针。
- * @param elapsed_us 距上次调用的时间（µs）。
  * @retval app_foc_control_ok 操作成功。
  * @retval app_foc_control_err_param 参数无效。
  * @retval app_foc_control_err_state 对象未就绪或服务层/PWM 拒绝。
- * @retval app_foc_control_err_not_aligned 尚未完成零点标定。
  */
-app_foc_control_status_enum app_foc_control_open_loop_uq(app_foc_control_t *p_object,
-                                                         uint32_t elapsed_us)
+app_foc_control_status_enum app_foc_control_open_loop_d_q15(app_foc_control_t *p_object)
 {
     app_foc_control_status_enum status;
-    svc_foc_value_t angle_pu;
-    svc_foc_value_t zero_voltage_v;
-    svc_foc_value_t uq_voltage_v;
-    int64_t delta_q;
+    svc_foc_value_t angle_pu = {0};
+    svc_foc_value_t ud_voltage_q15 = {0};
+    svc_foc_value_t zero_voltage_q15 = {0};
 
     if (!app_foc_control_is_object_valid(p_object)) {
         return app_foc_control_err_param;
@@ -590,59 +566,34 @@ app_foc_control_status_enum app_foc_control_open_loop_uq(app_foc_control_t *p_ob
         (p_object->state != app_foc_control_state_running)) {
         return app_foc_control_err_state;
     }
-    if (!p_object->is_zero_aligned) {
-        return app_foc_control_err_not_aligned;
+    if ((p_object->config.open_loop_adc_irq_count == 0U) ||
+        (p_object->config.open_loop_angle_step_q15 <= 0)) {
+        return app_foc_control_err_param;
     }
 
-    /* 角度积分（Q15 标幺）：Δ = f(mHz) × Δt(µs) × 32768 / 1e9，四舍五入 */
-    delta_q = (((int64_t)p_object->config.open_loop_frequency_millihz
-                * (int64_t)elapsed_us
-                * (int64_t)APP_FOC_CONTROL_PU_ONE_Q)
-               + APP_FOC_CONTROL_ANGLE_ROUND) / APP_FOC_CONTROL_ANGLE_DIVISOR;
-    p_object->open_loop_angle_pu_q =
-        (PLAT_IQ_TYPE)(((int64_t)p_object->open_loop_angle_pu_q + delta_q)
-                       & (int64_t)APP_FOC_CONTROL_PU_MASK);
+    /* 累加 Q15 标幺角度步进，越过一周上限后回绕到零。 */
+    p_object->open_loop_angle_pu_q += p_object->config.open_loop_angle_step_q15;
+    if (p_object->open_loop_angle_pu_q >= APP_FOC_CONTROL_ANGLE_PERIOD_Q15) {
+        p_object->open_loop_angle_pu_q = 0;
+    }
+    angle_pu.q_value = p_object->open_loop_angle_pu_q;
 
-    angle_pu = app_foc_control_make_angle(p_object->open_loop_angle_pu_q);
+    /* 电流观测失败不阻止强拖输出。 */
+    // (void)svc_foc_ops->pf_get_current(&svc_foc_motor, angle_pu);
 
-    /* 电流观测：失败不影响输出（仅观测值不刷新） */
-    (void)svc_foc_ops->pf_get_current(&svc_foc_motor, angle_pu);
-
-    /* 开环矢量：dq = (0, open_loop_uq_v)，由服务层完成逆 Park + SVPWM + PWM 下发 */
-    zero_voltage_v = app_foc_control_make_voltage(0.0f);
-    uq_voltage_v = app_foc_control_make_voltage(p_object->config.open_loop_uq_v);
+    /* d 轴强拖参数已是 Q15 标幺值，直接送入服务层；Uq 固定为零。 */
+    ud_voltage_q15.q_value = p_object->config.open_loop_ud_q15;
+    zero_voltage_q15.q_value = 0;
     status = app_foc_control_map_status(
         svc_foc_ops->pf_output_dq_pwm(&svc_foc_motor,
-                                      zero_voltage_v,
-                                      uq_voltage_v,
+                                      ud_voltage_q15,
+                                      zero_voltage_q15,
                                       angle_pu));
     if (status != app_foc_control_ok) {
         return status;
     }
 
     p_object->state = app_foc_control_state_running;
-    return app_foc_control_ok;
-}
-
-/**
- * @brief 运行中修改开环 Uq 与电频率。
- * @param p_object 应用 FOC 控制对象指针。
- * @param uq_v 开环 Uq（V）。
- * @param frequency_millihz 开环电频率（mHz，带符号表示转向）。
- * @retval app_foc_control_ok 操作成功。
- * @retval app_foc_control_err_param 参数无效。
- */
-app_foc_control_status_enum app_foc_control_set_open_loop(app_foc_control_t *p_object,
-                                                          float uq_v,
-                                                          int32_t frequency_millihz)
-{
-    if (!app_foc_control_is_object_valid(p_object)) {
-        return app_foc_control_err_param;
-    }
-
-    p_object->config.open_loop_uq_v = uq_v;
-    p_object->config.open_loop_frequency_millihz = frequency_millihz;
-
     return app_foc_control_ok;
 }
 
@@ -663,8 +614,7 @@ app_foc_control_state_enum app_foc_control_get_state(const app_foc_control_t *p_
 static const app_foc_control_ops_t s_app_foc_control_ops = {
     .pf_init = app_foc_control_init,
     .pf_zero_calibrate = app_foc_control_zero_calibrate,
-    .pf_open_loop_uq = app_foc_control_open_loop_uq,
-    .pf_set_open_loop = app_foc_control_set_open_loop,
+    .pf_open_loop_d_q15 = app_foc_control_open_loop_d_q15,
     .pf_get_state = app_foc_control_get_state
 };
 
@@ -695,6 +645,7 @@ PLAT_ISR_DEFINE(PLAT_ISR_ADC1_2)
             hal_gpio_ops->pf_write(&hal_gpio_io_test,hal_gpio_test_pin_1,0);
         }
 
-        bsp_current_sense_calc(&bsp_current_sense_three_phase);
+        // bsp_current_sense_calc(&bsp_current_sense_three_phase);
+        // (void)app_foc_control_open_loop_d_q15(&app_foc_control_motor);
     }
 }

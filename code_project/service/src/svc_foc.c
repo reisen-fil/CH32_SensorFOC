@@ -2,9 +2,9 @@
  * @file svc_foc.c
  * @brief FOC 服务层实现（电流获取 + dq 电压 → 三相 PWM 输出）。
  * @details 对外只有四个接口（init / get_state / output_dq_pwm / get_current），内部实现：
- *            dq(V) --逆Park--> αβ(V) --÷母线电压--> αβ(标幺) --SVPWM--> 占空比(标幺)
+ *            dq(标幺) --逆Park--> αβ(标幺) --SVPWM--> 占空比(标幺)
  *                  --×pwm_period--> 比较值计数 --> bsp_motor_ctrl_ops->pf_set_duty()
- *            三相电流(A) --Clarke--> αβ(A) --Park--> dq(A)（观测用，供上层上报/调试）
+ *            三相电流(标幺) --Clarke--> αβ(标幺) --Park--> dq(标幺)（观测用）
  *          Clarke/Park/SVPWM/三角运算全部是本文件内的 static 函数，不对外暴露。
  *          运算类型由 config.arithmetic_type 分派：Q15 定点路径全程 PLAT_IQ_*（三角运算用
  *          PLAT_IQ_SIN_PU / PLAT_IQ_COS_PU），浮点路径走单精度运算与 sinf / cosf。
@@ -30,14 +30,14 @@
 
 /**
  * @brief FOC 服务层板级配置（Q15 定点 + 扇区法）。
- * @details pwm_period 取 HAL_TIM_PWM_PERIOD（12 kHz 中心对齐，144 MHz/(12000×2) = 6000）；
- *          dc_bus_voltage_v 是母线电压，SVPWM 用它把伏特归一化成占空比，接不同母线只需改这里。
+ * @details pwm_period 取 HAL_TIM_PWM_PERIOD；dc_bus_voltage_v 直接使用头文件配置的电压基值，
+ *          作为母线电压 Q15 缓存保留。SVPWM 输入已是标幺电压，不再重复归一化。
  */
 static const svc_foc_config_t s_svc_foc_config = {
     .arithmetic_type = svc_foc_arithmetic_q15,
-    .modulation = svc_foc_modulation_svpwm_sector,
+    .modulation = svc_foc_modulation_svpwm_third_harmonic,
     .pwm_period = (uint16_t)HAL_TIM_PWM_PERIOD,
-    .dc_bus_voltage_v = 12.0f,
+    .dc_bus_voltage_v = SVC_FOC_BASE_VOLTAGE_V,
     .p_user_data = NULL
 };
 
@@ -477,60 +477,40 @@ static void svc_foc_svpwm_third_harmonic_float(const svc_foc_t *p_object,
 }
 
 /**
- * @brief SVPWM 计算（含母线电压归一化）：αβ 电压（V）→ 三相标幺占空比。
- * @details 先把伏特除以母线电压归一化成标幺母线电压（1.0 = Vdc），再按调制方式与运算
- *          类型分派到四个具体实现；母线电压非正时返回参数错误，避免除零。
+ * @brief SVPWM 计算：αβ 标幺电压 → 三相标幺占空比。
+ * @details 输入 αβ 已按 SVC_FOC_BASE_VOLTAGE_V 归一化，直接分派到具体 SVPWM 实现；
+ *          dc_bus_q 保留为服务层母线基值缓存，不在此处再次参与归一化。
  * @param p_object FOC 服务对象指针。
- * @param p_voltage_v 输入 αβ 电压（V）。
+ * @param p_voltage_pu 输入 αβ 标幺电压。
  * @param p_duty_pu 输出三相标幺占空比与扇区号。
  * @retval svc_foc_ok 操作成功。
- * @retval svc_foc_err_param 母线电压为零。
+ * @retval svc_foc_err_param 参数无效。
  * @retval svc_foc_err_unsupported 运算类型或调制方式不受支持。
  */
 static svc_foc_status_enum svc_foc_svpwm_calc(const svc_foc_t *p_object,
-                                              const svc_foc_alpha_beta_t *p_voltage_v,
+                                              const svc_foc_alpha_beta_t *p_voltage_pu,
                                               svc_foc_duty_pu_t *p_duty_pu)
 {
-    svc_foc_alpha_beta_t voltage_pu;
-
     if ((p_object->config.arithmetic_type != svc_foc_arithmetic_q15) &&
         (p_object->config.arithmetic_type != svc_foc_arithmetic_float)) {
         return svc_foc_err_unsupported;
     }
 
-    /* 母线电压归一化：伏特 → 标幺母线电压 */
-    if (svc_foc_is_q15(p_object)) {
-        if (p_object->dc_bus_q <= 0) {
-            return svc_foc_err_param;
-        }
-        voltage_pu.alpha.q_value = PLAT_IQ_DIV(p_voltage_v->alpha.q_value,
-                                              p_object->dc_bus_q);
-        voltage_pu.beta.q_value = PLAT_IQ_DIV(p_voltage_v->beta.q_value,
-                                             p_object->dc_bus_q);
-    } else {
-        if (p_object->config.dc_bus_voltage_v <= 0.0f) {
-            return svc_foc_err_param;
-        }
-        voltage_pu.alpha.float_value =
-            p_voltage_v->alpha.float_value / p_object->config.dc_bus_voltage_v;
-        voltage_pu.beta.float_value =
-            p_voltage_v->beta.float_value / p_object->config.dc_bus_voltage_v;
-    }
-
+    /* 输入已经是按电压基值归一化的 αβ 标幺值，直接进入 SVPWM。 */
     switch (p_object->config.modulation) {
     case svc_foc_modulation_svpwm_sector:
         if (svc_foc_is_q15(p_object)) {
-            svc_foc_svpwm_sector_q15(p_object, &voltage_pu, p_duty_pu);
+            svc_foc_svpwm_sector_q15(p_object, p_voltage_pu, p_duty_pu);
         } else {
-            svc_foc_svpwm_sector_float(p_object, &voltage_pu, p_duty_pu);
+            svc_foc_svpwm_sector_float(p_object, p_voltage_pu, p_duty_pu);
         }
         break;
 
     case svc_foc_modulation_svpwm_third_harmonic:
         if (svc_foc_is_q15(p_object)) {
-            svc_foc_svpwm_third_harmonic_q15(p_object, &voltage_pu, p_duty_pu);
+            svc_foc_svpwm_third_harmonic_q15(p_object, p_voltage_pu, p_duty_pu);
         } else {
-            svc_foc_svpwm_third_harmonic_float(p_object, &voltage_pu, p_duty_pu);
+            svc_foc_svpwm_third_harmonic_float(p_object, p_voltage_pu, p_duty_pu);
         }
         break;
 
@@ -622,14 +602,14 @@ svc_foc_state_enum svc_foc_get_state(const svc_foc_t *p_object)
 }
 
 /**
- * @brief dq 轴电压（伏特）→ 三相 PWM 输出。
+ * @brief dq 轴标幺电压 → 三相 PWM 输出。
  * @details dq 入参是定点/浮点兼容的并集类型：调用方按 config.arithmetic_type 填好对应
- *          成员（Q15 填 q_value，1.0 = 1 V；浮点填 float_value，单位 V），本函数直接透传，
- *          不再做类型换算。内部链路：逆 Park(伏特) → 母线电压归一化 → SVPWM → 占空比
+ *          成员（Q15 或浮点均使用标幺值，1.0 pu = SVC_FOC_BASE_VOLTAGE_V），本函数直接透传，
+ *          不再做单位换算。内部链路：逆 Park(标幺) → SVPWM → 占空比
  *          × pwm_period → 比较值计数 → 经 BSP 下发三相 PWM。
  * @param p_object FOC 服务对象指针。
- * @param d_axis_v d 轴电压（V，按运算类型取并集对应成员）。
- * @param q_axis_v q 轴电压（V，按运算类型取并集对应成员）。
+ * @param d_axis_v d 轴标幺电压（按运算类型取并集对应成员）。
+ * @param q_axis_v q 轴标幺电压（按运算类型取并集对应成员）。
  * @param angle_pu 标幺电角度。
  * @retval svc_foc_ok 操作成功。
  * @retval svc_foc_err_param 参数无效或母线电压为 0。
@@ -655,11 +635,11 @@ svc_foc_status_enum svc_foc_output_dq_pwm(svc_foc_t *p_object,
     voltage_dq_v.q = q_axis_v;
     p_object->voltage_dq = voltage_dq_v;
 
-    /* 逆 Park：dq(V) → αβ(V) */
+    /* 逆 Park：dq 标幺电压 → αβ 标幺电压 */
     svc_foc_inverse_park_calc(p_object, &voltage_dq_v, angle_pu,
                               &p_object->voltage_alpha_beta);
 
-    /* SVPWM：αβ(V) → 母线电压归一化 → 三相标幺占空比 */
+    /* SVPWM：αβ 标幺电压 → 三相标幺占空比 */
     status = svc_foc_svpwm_calc(p_object, &p_object->voltage_alpha_beta, &duty_pu);
     if (status != svc_foc_ok) {
         return status;
@@ -679,7 +659,7 @@ svc_foc_status_enum svc_foc_output_dq_pwm(svc_foc_t *p_object,
 }
 
 /**
- * @brief 采样三相电流并更新 Clarke/Park 观测值。
+ * @brief 采样三相电流并更新标幺 Clarke/Park 观测值。
  * @param p_object FOC 服务对象指针。
  * @param angle_pu 用于 Park 变换的标幺电角度。
  * @retval svc_foc_ok 操作成功。
@@ -705,17 +685,45 @@ svc_foc_status_enum svc_foc_get_current(svc_foc_t *p_object, svc_foc_value_t ang
         return svc_foc_err_state;
     }
 
-    if (svc_foc_is_q15(p_object)) {
-        p_object->current_abc.phase_u.q_value = bsp_current_sense_three_phase.current_q_u;
-        p_object->current_abc.phase_v.q_value = bsp_current_sense_three_phase.current_q_v;
-        p_object->current_abc.phase_w.q_value = bsp_current_sense_three_phase.current_q_w;
-    } else {
-        p_object->current_abc.phase_u.float_value =
-            bsp_current_sense_three_phase.current_a_u;
-        p_object->current_abc.phase_v.float_value =
-            bsp_current_sense_three_phase.current_a_v;
-        p_object->current_abc.phase_w.float_value =
-            bsp_current_sense_three_phase.current_a_w;
+    {
+        bsp_current_sense_value_t current_pu;
+        int32_t current_ma;
+        uint8_t phase;
+        svc_foc_abc_t current_abc;
+
+        (void)memset(&current_abc, 0, sizeof(current_abc));
+
+        /* BSP 标幺值直接作为 service 层标幺电流观测值，mA 输出无需参与控制计算。 */
+        for (phase = 0U; phase < (uint8_t)bsp_current_sense_phase_count; phase++) {
+            if (bsp_current_sense_ops->pf_get_current(
+                    &bsp_current_sense_three_phase,
+                    phase,
+                    &current_pu,
+                    &current_ma) != bsp_current_sense_ok) {
+                return svc_foc_err_state;
+            }
+
+            (void)current_ma;
+            if (svc_foc_is_q15(p_object)) {
+                if (phase == (uint8_t)bsp_current_sense_phase_u) {
+                    current_abc.phase_u.q_value = current_pu.q_value;
+                } else if (phase == (uint8_t)bsp_current_sense_phase_v) {
+                    current_abc.phase_v.q_value = current_pu.q_value;
+                } else {
+                    current_abc.phase_w.q_value = current_pu.q_value;
+                }
+            } else {
+                if (phase == (uint8_t)bsp_current_sense_phase_u) {
+                    current_abc.phase_u.float_value = current_pu.float_value;
+                } else if (phase == (uint8_t)bsp_current_sense_phase_v) {
+                    current_abc.phase_v.float_value = current_pu.float_value;
+                } else {
+                    current_abc.phase_w.float_value = current_pu.float_value;
+                }
+            }
+        }
+
+        p_object->current_abc = current_abc;
     }
 
     /* 三相电流 → αβ → dq（纯观测，供上层上报/调试） */

@@ -4,18 +4,18 @@
  * @details 本模块承担 FOC 链路的"运算 + 硬件下发"，对外只暴露四个接口：
  *          - svc_foc_init()：注入板级配置表（运算类型、调制方式、PWM 满量程、母线电压）；
  *          - svc_foc_get_state()：查询服务层状态；
- *          - svc_foc_output_dq_pwm()：dq 轴电压（**伏特**，定点/浮点兼容的并集入参）→ 逆 Park
- *            → SVPWM（含母线电压归一化）→ 三相占空比**计数**（0 ~ pwm_period）→ 经 BSP
+ *          - svc_foc_output_dq_pwm()：dq 轴标幺电压（定点/浮点兼容的并集入参）→ 逆 Park
+ *            → SVPWM → 三相占空比**计数**（0 ~ pwm_period）→ 经 BSP
  *            直接下发三相 PWM；
  *          - svc_foc_get_current()：采样三相电流 → Clarke → Park（按电角度）→ 更新对象中
  *            的 current_abc / current_alpha_beta / current_dq 供上层观测。
  *          Clarke/Park 正逆变换、SVPWM 调制、三角函数等全部是本文件内的 static 实现，
  *          不出现在头文件里；上层（app_foc_control）只调用上述四个接口。
  *
- *          量纲约定 —— **整条 FOC 链路只有电角度用标幺形式**：
+ *          量纲约定 —— FOC 控制量统一使用标幺形式：
  *          - 电角度：标幺值（0 ~ 1 对应 0 ~ 2π），Q15 时 1.0 = 32768；
- *          - dq/αβ 电压：**伏特**（V），SVPWM 内部除以 config.dc_bus_voltage_v 归一化；
- *          - 电流：**安培**（A，Q15 时 1.0 = 1 A，与 bsp_current_sense 一致）；
+ *          - dq/αβ 电压：标幺值（1.0 pu = SVC_FOC_BASE_VOLTAGE_V）；
+ *          - 电流：标幺值（1.0 pu = SVC_FOC_BASE_CURRENT_A）；
  *          - PWM 占空比：**计数**（0 ~ config.pwm_period），直接交给 bsp_motor_ctrl，
  *            中间不再经过百分比/标幺量。
  *
@@ -32,6 +32,18 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/**
+ * @brief FOC 标幺基准值配置。
+ * @details 电压、电流和电角速度基值分别用于定义服务层控制量的物理量纲：
+ *          1.0 pu 电压 = 12 V，1.0 pu 电流 = 2.0 A，1.0 pu 电角速度 = 1000 r/s。
+ *          角速度基值同时提供 rad/s 形式，供后续电机参数和速度环计算使用。
+ */
+#define SVC_FOC_BASE_VOLTAGE_V                 (12.0f)
+#define SVC_FOC_BASE_CURRENT_A                 (2.0f)
+#define SVC_FOC_BASE_ELECTRICAL_SPEED_RPS      (1000.0f)
+#define SVC_FOC_BASE_ELECTRICAL_SPEED_RAD_S    \
+    (SVC_FOC_BASE_ELECTRICAL_SPEED_RPS * 6.2831853071795864769f)
 
 /** @brief FOC 服务层状态。 */
 typedef enum {
@@ -79,7 +91,7 @@ typedef union {
     float float_value;      /**< 单精度浮点值 */
 } svc_foc_value_t;
 
-/** @brief 三相量（U/V/W）：电流为安培，电压为伏特。 */
+/** @brief 三相标幺量（U/V/W）：电流和电压均按服务层基值归一化。 */
 typedef struct {
     svc_foc_value_t phase_u;   /**< U 相 */
     svc_foc_value_t phase_v;   /**< V 相 */
@@ -116,14 +128,14 @@ typedef struct {
  *          - modulation：SVPWM 计算方式（本板取扇区法）；
  *          - pwm_period：PWM 满量程计数（= HAL_TIM_PWM_PERIOD，与 bsp_motor_ctrl 一致），
  *            标幺占空比按它换算成比较值；
- *          - dc_bus_voltage_v：母线电压（V），SVPWM 用它把伏特归一化成标幺占空比。
+ *          - dc_bus_voltage_v：母线电压基值（V），保留为配置和 Q15 缓存供服务层使用。
  */
 typedef struct {
     svc_foc_arithmetic_enum arithmetic_type;   /**< 运算类型：Q15 / 浮点 */
     svc_foc_modulation_enum modulation;        /**< SVPWM 计算方式：扇区法 / 三次谐波 */
 
     uint16_t pwm_period;                       /**< PWM 满量程计数（与 BSP 三相 PWM 一致） */
-    float dc_bus_voltage_v;                    /**< 母线电压（V），用于电压归一化 */
+    float dc_bus_voltage_v;                    /**< 母线电压基值（V） */
 
     void *p_user_data;                         /**< 上层私有数据 */
 } svc_foc_config_t;
@@ -145,8 +157,8 @@ typedef struct {
     svc_foc_abc_t current_abc;               /**< 最近一次三相电流（A） */
     svc_foc_alpha_beta_t current_alpha_beta; /**< 最近一次 Clarke 结果（A） */
     svc_foc_dq_t current_dq;                 /**< 最近一次 Park 结果（A） */
-    svc_foc_dq_t voltage_dq;                 /**< 最近一次下发的 dq 电压（V） */
-    svc_foc_alpha_beta_t voltage_alpha_beta; /**< 最近一次逆 Park 结果（V） */
+    svc_foc_dq_t voltage_dq;                 /**< 最近一次下发的 dq 电压标幺值 */
+    svc_foc_alpha_beta_t voltage_alpha_beta; /**< 最近一次逆 Park 结果标幺值 */
     svc_foc_pwm_t pwm_output;                /**< 最近一次下发的三相占空比计数 + 扇区 */
 } svc_foc_t;
 
@@ -171,10 +183,10 @@ svc_foc_status_enum svc_foc_init(svc_foc_t *p_object);
 svc_foc_state_enum svc_foc_get_state(const svc_foc_t *p_object);
 
 /**
- * @brief dq 轴电压（伏特）→ 三相 PWM 输出。
+ * @brief dq 轴电压标幺值 → 三相 PWM 输出。
  * @details 计算链路：
- *          1) 由 dq 电压做逆 Park 得 αβ 电压（V）；
- *          2) SVPWM：αβ 除以母线电压归一化 → 按 config.modulation 算三相占空比
+ *          1) 由 dq 标幺电压做逆 Park 得 αβ 标幺电压；
+ *          2) SVPWM 直接使用 αβ 标幺值计算三相占空比，不再重复除以母线电压；
  *             （扇区法或三次谐波注入法，均限幅到 [0, 1]）；
  *          3) 占空比 × pwm_period 得比较值计数，经 bsp_motor_ctrl_ops->pf_set_duty() 下发。
  *          中间结果（voltage_dq / voltage_alpha_beta / pwm_output）同步存进对象便于观测。
@@ -185,7 +197,7 @@ svc_foc_state_enum svc_foc_get_state(const svc_foc_t *p_object);
  * @param q_axis_v q 轴电压（V，按运算类型取并集对应成员）。
  * @param angle_pu 标幺电角度（0 ~ 1，按运算类型取并集的对应成员）。
  * @retval svc_foc_ok 操作成功，已下发新的三相占空比。
- * @retval svc_foc_err_param 参数无效或母线电压为 0。
+ * @retval svc_foc_err_param 参数无效。
  * @retval svc_foc_err_state 服务层未初始化或 BSP 三相 PWM 拒绝。
  * @retval svc_foc_err_unsupported 运算类型或调制方式不受支持。
  */
@@ -195,7 +207,7 @@ svc_foc_status_enum svc_foc_output_dq_pwm(svc_foc_t *p_object,
                                           svc_foc_value_t angle_pu);
 
 /**
- * @brief 采样三相电流并更新 Clarke/Park 观测值。
+ * @brief 采样三相电流并更新标幺 Clarke/Park 观测值。
  * @details 电流采样对象未初始化（状态非 ready/running）或采样失败时返回
  *          svc_foc_err_state，此时对象内的 current_* 字段保持上一次的值——本接口只做观测，
  *          失败不应影响上层的输出决策。

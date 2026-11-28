@@ -130,7 +130,7 @@ struct hal_tim {
  * 板级常量：参数取自参考实现 drv_tim.c
  * -------------------------------------------------------------------------- */
 
-/** @brief PWM 载波频率（drv_tim.c 注释标注 6kHz）。 */
+/** @brief PWM 载波频率（drv_tim.c 注释标注 12kHz）。 */
 #define HAL_TIM_PWM_FREQUENCY_HZ    (12000U)
 /** @brief 定时器输入时钟（本工程系统时钟 144MHz，APB2 定时器时钟 144MHz）。 */
 #define HAL_TIM_PWM_CLOCK_HZ        (144000000U)
