@@ -8,10 +8,10 @@
  *            先对 24 位帧的 18 位数据域做 CRC-6 校验（bsp_encoder_mt6701_crc6_itu），
  *            校验通过后才取原始机械角度与 Mg 状态位，再做方向归一与零点对齐；
  *          - bsp_encoder_mt6701_get_electrical_angle() 先调用机械角度获取函数，再按极对数折算电角度；
- *          - bsp_encoder_mt6701_get_angle_pu() 按角度种类读取标幺值（统一浮点出口）；
+ *          - bsp_encoder_mt6701_get_angle_pu() 按构建所选格式读取标幺值；
  *          - bsp_encoder_get_velocity() 差分计算机械转速（通用接口，不绑定传感器）。
  *          角度信息全部保存于 config 结构体中：计数域为原始计数，标幺域为 0 ~ 1
- *          （Q15 或浮点，由 config.arithmetic_type 选择），本文件不做任何弧度换算。
+ *          （Q15 或浮点，由 FOC 构建宏选择），本文件不做弧度换算.
  */
 
 /* 
@@ -25,6 +25,12 @@
 
 #include "bsp_encoder.h"
 #include <stddef.h>
+
+#if defined(FOC_USE_Q15) && defined(FOC_USE_FLOAT)
+#error "Select only one FOC arithmetic implementation"
+#elif !defined(FOC_USE_Q15) && !defined(FOC_USE_FLOAT)
+#error "Define FOC_USE_Q15 or FOC_USE_FLOAT in the CMake configuration"
+#endif
 
 /* ==========================================================================
  * 板级常量与配置
@@ -64,7 +70,9 @@
  *       （PLAT_IQ_MPY_I32 整数乘）。14 位分辨率时 1/16384 在 Q15 中恰为 2，
  *       故"计数 → 标幺"的定标换算精确、无截断误差。
  */
-#define BSP_MT6701_PU_PER_COUNT_Q          PLAT_IQ(1.0f / (float)BSP_MT6701_ANGLE_RESOLUTION)     // 需要根据取的定点运算小数位数确认存储精度是否过低
+#if defined(FOC_USE_Q15)
+#define BSP_MT6701_PU_PER_COUNT_Q          PLAT_IQ(1.0f / (float)BSP_MT6701_ANGLE_RESOLUTION)
+#endif
 
 /**
  * @brief 板级电机极对数（电角度计数 = 机械角度计数 × 极对数，取单圈）。
@@ -87,7 +95,6 @@ static const bsp_encoder_config_t s_mt6701_config = {
     .motor_pole_pairs = BSP_ENCODER_MOTOR_POLE_PAIRS,
     .direction = bsp_encoder_direction_reverse,
     .resolution_bits = BSP_MT6701_ANGLE_RESOLUTION_BITS,
-    .arithmetic_type = bsp_encoder_arithmetic_q,
     .zero_offset = 0U,
     .sample_period_us = BSP_ENCODER_SAMPLE_PERIOD_US,
     .timeout_count = 10000U,
@@ -97,10 +104,17 @@ static const bsp_encoder_config_t s_mt6701_config = {
     .raw_electrical_angle = 0U,
     .zero_aligned_mechanical_angle = 0U,
     .zero_aligned_electrical_angle = 0U,
+#if defined(FOC_USE_Q15)
     .raw_mechanical_angle_pu = {.q_value = 0},
     .zero_aligned_mechanical_angle_pu = {.q_value = 0},
     .raw_electrical_angle_pu = {.q_value = 0},
     .zero_aligned_electrical_angle_pu = {.q_value = 0},
+#else
+    .raw_mechanical_angle_pu = {.float_value = 0.0f},
+    .zero_aligned_mechanical_angle_pu = {.float_value = 0.0f},
+    .raw_electrical_angle_pu = {.float_value = 0.0f},
+    .zero_aligned_electrical_angle_pu = {.float_value = 0.0f},
+#endif
     .mg_status = {.value = 0U},
     /* 零点对齐完成标志（初始化时为未对齐） */
     .is_zero_aligned = false,
@@ -167,42 +181,19 @@ static uint8_t bsp_encoder_mt6701_crc6_itu(const uint8_t *p_data,
 }
 
 /**
- * @brief 把单圈角度计数按配置的运算方式换算成标幺值（0 ~ 1）并写入标幺字段。
- * @details - Q 格式运算：标幺值 = 计数 ÷ 分辨率，全程定点——先用 PLAT_IQ() 把
- *              "每计数对应的标幺量"定点化，再用 PLAT_IQ_MPY_I32()（Q15 × 整数 → Q15）
- *              做整数乘，无浮点参与（14 位分辨率下换算精确，见 BSP_MT6701_PU_PER_COUNT_Q）；
- *            - 浮点运算：标幺值 = 计数 ÷ 分辨率（浮点域）。
- * @param p_config 编码器配置（含运算方式）。
+ * @brief 把单圈角度计数按构建所选格式换算成标幺值（0 ~ 1）。
  * @param counts 单圈角度计数（0 … 分辨率 - 1）。
- * @param p_pu 输出：标幺值字段（按运算方式写入对应成员）。
+ * @param p_pu 输出：构建所选格式的标幺值。
  */
-static void bsp_encoder_counts_to_pu(const bsp_encoder_config_t *p_config,
-                                     uint32_t counts,
+static void bsp_encoder_counts_to_pu(uint32_t counts,
                                      bsp_encoder_pu_angle_t *p_pu)
 {
-    if (p_config->arithmetic_type == bsp_encoder_arithmetic_q) {
-        p_pu->q_value =
-            PLAT_IQ_MPY_I32(BSP_MT6701_PU_PER_COUNT_Q, (int32_t)counts);
-    } else {
-        p_pu->float_value =
-            (float)counts / (float)BSP_MT6701_ANGLE_RESOLUTION;
-    }
-}
-
-/**
- * @brief 按运算方式把标幺字段转换成浮点标幺值（统一浮点出口的内部实现）。
- * @param p_config 编码器配置（含运算方式）。
- * @param p_pu 标幺值字段。
- * @return 标幺角度（0.0f ~ 1.0f）。
- */
-static float bsp_encoder_pu_to_float(const bsp_encoder_config_t *p_config,
-                                     const bsp_encoder_pu_angle_t *p_pu)
-{
-    if (p_config->arithmetic_type == bsp_encoder_arithmetic_q) {
-        return PLAT_IQ_TO_FLOAT(p_pu->q_value);
-    }
-
-    return p_pu->float_value;
+#if defined(FOC_USE_Q15)
+    p_pu->q_value = PLAT_IQ_MPY_I32(BSP_MT6701_PU_PER_COUNT_Q,
+                                    (int32_t)counts);
+#else
+    p_pu->float_value = (float)counts / (float)BSP_MT6701_ANGLE_RESOLUTION;
+#endif
 }
 
 /* ==========================================================================
@@ -313,7 +304,7 @@ bsp_encoder_status_enum bsp_encoder_mt6701_get_mechanical_angle(
                             BSP_MT6701_ANGLE_MASK;
     }
     p_object->config.raw_mechanical_angle = (uint16_t)mechanical_counts;
-    bsp_encoder_counts_to_pu(&p_object->config, mechanical_counts,
+    bsp_encoder_counts_to_pu(mechanical_counts,
                              &p_object->config.raw_mechanical_angle_pu);
 
     /* 零点对齐：仅在"零点对齐完成"标志置位时计算（前置条件） */
@@ -322,7 +313,7 @@ bsp_encoder_status_enum bsp_encoder_mt6701_get_mechanical_angle(
                          BSP_MT6701_ANGLE_MASK;
         p_object->config.zero_aligned_mechanical_angle = (uint16_t)aligned_counts;
         bsp_encoder_counts_to_pu(
-            &p_object->config, aligned_counts,
+            aligned_counts,
             &p_object->config.zero_aligned_mechanical_angle_pu);
     }
 
@@ -364,8 +355,7 @@ bsp_encoder_status_enum bsp_encoder_mt6701_get_electrical_angle(
     p_object->config.raw_electrical_angle = (uint16_t)(
         ((uint32_t)p_object->config.raw_mechanical_angle * pole_pairs) %
         BSP_MT6701_ANGLE_RESOLUTION);
-    bsp_encoder_counts_to_pu(&p_object->config,
-                             p_object->config.raw_electrical_angle,
+    bsp_encoder_counts_to_pu(p_object->config.raw_electrical_angle,
                              &p_object->config.raw_electrical_angle_pu);
 
     /* 零点对齐电角度同样以"零点对齐完成"为前置条件 */
@@ -374,7 +364,6 @@ bsp_encoder_status_enum bsp_encoder_mt6701_get_electrical_angle(
             ((uint32_t)p_object->config.zero_aligned_mechanical_angle * pole_pairs) %
             BSP_MT6701_ANGLE_RESOLUTION);
         bsp_encoder_counts_to_pu(
-            &p_object->config,
             p_object->config.zero_aligned_electrical_angle,
             &p_object->config.zero_aligned_electrical_angle_pu);
     }
@@ -383,10 +372,8 @@ bsp_encoder_status_enum bsp_encoder_mt6701_get_electrical_angle(
 }
 
 /**
- * @brief 按角度种类读取标幺值（0 ~ 1，统一浮点出口）。
- * @details 按 config.arithmetic_type 取对应标幺字段：Q 格式运算时经 Q15 接口
- *          PLAT_IQ_TO_FLOAT() 换算成浮点，浮点运算时直接取用；
- *          零点对齐类角度以 is_zero_aligned 为前置条件，未对齐时直接报状态错误。
+ * @brief 按角度种类读取构建所选格式的标幺值。
+ * @details 零点对齐类角度以 is_zero_aligned 为前置条件，未对齐时直接报状态错误。
  * @param p_object 编码器对象指针。
  * @param angle 角度种类，取 bsp_encoder_angle_x。
  * @param p_value 输出：标幺角度（0.0f ~ 1.0f）。
@@ -432,7 +419,11 @@ bsp_encoder_status_enum bsp_encoder_mt6701_get_angle_pu(
         return bsp_encoder_err_state;
     }
 
-    p_value = p_pu;             // 确认数据获取前置条件没问题后进行写入
+#if defined(FOC_USE_Q15)
+    p_value->q_value = p_pu->q_value;
+#else
+    p_value->float_value = p_pu->float_value;
+#endif
 
     return bsp_encoder_ok;
 }

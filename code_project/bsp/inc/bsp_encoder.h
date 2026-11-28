@@ -5,14 +5,14 @@
  *          - bsp_encoder_mt6701_init()：构建 SPI 引脚组与 SPI 实例，复位角度与转速状态；
  *          - bsp_encoder_mt6701_get_mechanical_angle()：一次 SPI 采样，先做 CRC-6 校验，
  *            校验通过后更新原始机械角度（已做方向校正）、Mg 状态位与零点对齐后的机械
- *            角度（均为原始计数），并按配置的运算方式同步算出两者的标幺值（0 ~ 1）；
+ *            角度（均为原始计数），并按构建宏选择的格式同步算出两者的标幺值（0 ~ 1）；
  *          - bsp_encoder_mt6701_get_electrical_angle()：在调用机械角度获取函数的基础上，
  *            按极对数折算原始电角度与零点对齐后的电角度（原始计数）及其标幺值；
- *          - bsp_encoder_mt6701_get_angle_pu()：按角度种类读取标幺值（统一浮点出口）；
+ *          - bsp_encoder_mt6701_get_angle_pu()：按角度种类读取构建所选格式的标幺值；
  *          - bsp_encoder_get_velocity()：差分计算机械转速（本次与上一次采样的计数差）；
  *          - bsp_encoder_get_state()：查询对象状态。
  *          角度信息分两套并存：**原始计数域**（0 … 单圈计数 - 1，可直接作正弦表索引）
- *          与**标幺值域**（0 ~ 1，Q15 或浮点，由 config.arithmetic_type 选择）；
+ *          与**标幺值域**（0 ~ 1，Q15 或浮点，由 FOC 构建宏选择）；
  *          本层只做"计数 ↔ 标幺"换算，不做弧度换算。
  *          接口内部一律经 HAL GPIO / HAL SPI 函数表指针（hal_gpio_ops、hal_spi_ops）
  *          访问硬件；对象不携带操作表、不保存下层对象指针（板级单例
@@ -69,22 +69,8 @@ typedef enum {
 } bsp_encoder_direction_enum;
 
 /**
- * @brief 标幺角度的运算方式。
- * @details 决定各标幺角度字段按哪种方式计算与解释：
- *          - q：Q 格式运算，字段为 Q15 定点值（0 ~ 32768 对应标幺 0.0 ~ 1.0），
- *            换算一律经 platform_ch32v203.h 暴露的 PLAT_IQ_* 接口完成；
- *          - float：浮点运算，字段为浮点值（0.0f ~ 1.0f）。
- */
-typedef enum {
-    bsp_encoder_arithmetic_q = 0,      /**< Q 格式运算（Q15 定点） */
-    bsp_encoder_arithmetic_float       /**< 浮点运算 */
-} bsp_encoder_arithmetic_enum;
-
-/**
- * @brief 标幺角度值（0 ~ 1）：同一存储按 config.arithmetic_type 解释为 Q 格式或浮点。
- * @note 有效成员由 config.arithmetic_type 决定；取值请优先用
- *       bsp_encoder_mt6701_get_angle_pu()（统一浮点出口），
- *       定点消费者可按运算方式直接读取对应成员。
+ * @brief 标幺角度值（0 ~ 1）：同一存储按 FOC 构建宏选择的 Q15 或浮点格式解释。
+ * @note 仅构建所选格式成员有效；通过 bsp_encoder_mt6701_get_angle_pu() 读取。
  */
 typedef union {
     PLAT_IQ_TYPE q_value;    /**< Q 格式标幺值（Q15：0 ~ 32768 = 0.0 ~ 1.0） */
@@ -123,7 +109,7 @@ typedef union {
  * @brief 编码器配置与角度信息。
  * @details 前半部分为"怎么用这个编码器"的配置量；后半部分为最近一次**通过 CRC 校验**的
  *          采样信息，同一角度给出两套表示——**原始计数**（0 … 单圈计数 - 1）与
- *          **标幺值**（0 ~ 1，运算方式见 arithmetic_type），均不做弧度换算：
+ *          **标幺值**（0 ~ 1，格式由 FOC 构建宏选择），均不做弧度换算：
  *          - raw_mechanical_angle：已按 direction 做方向校正的原始机械角度（计数）；
  *          - raw_electrical_angle：由 raw_mechanical_angle 按极对数折算的原始电角度；
  *          - zero_aligned_*：在方向校正基础上再叠加 zero_offset 取单圈后的值，
@@ -140,7 +126,6 @@ typedef struct {
     uint8_t motor_pole_pairs;                  /**< 电机极对数（电角度 = 机械角度 × 极对数） */
     bsp_encoder_direction_enum direction;      /**< 角度正方向 */
     uint16_t resolution_bits;                  /**< 单圈分辨率位数（MT6701 为 14） */
-    bsp_encoder_arithmetic_enum arithmetic_type; /**< 标幺角度运算方式（Q 格式/浮点） */
     uint32_t zero_offset;                      /**< 零点偏置（计数），用于零点对齐 */
     uint32_t sample_period_us;                 /**< 采样周期（µs），差分测速用；0 表示未配置 */
     uint32_t timeout_count;                    /**< 传输等待超时计数 */
@@ -216,10 +201,8 @@ bsp_encoder_status_enum bsp_encoder_mt6701_get_mechanical_angle(bsp_encoder_t *p
 bsp_encoder_status_enum bsp_encoder_mt6701_get_electrical_angle(bsp_encoder_t *p_object);
 
 /**
- * @brief 按角度种类读取标幺值（0 ~ 1，统一浮点出口）。
- * @details 按 config.arithmetic_type 从对应标幺字段取值：Q 格式运算时经 Q15 接口
- *          PLAT_IQ_TO_FLOAT() 换算成浮点，浮点运算时直接取用；
- *          零点对齐类角度以 is_zero_aligned 为前置条件，未完成对齐时返回错误。
+ * @brief 按角度种类读取标幺值（0 ~ 1，格式由 FOC 构建宏选择）。
+ * @details 零点对齐类角度以 is_zero_aligned 为前置条件，未完成对齐时返回错误.
  * @param p_object 编码器对象指针。
  * @param angle 角度种类，取 bsp_encoder_angle_x。
  * @param p_value 输出：标幺角度（0.0f ~ 1.0f）。
@@ -263,7 +246,7 @@ typedef struct {
     /** @brief 读取标幺角度（见 bsp_encoder_mt6701_get_angle_pu）。 */
     bsp_encoder_status_enum (*pf_get_angle_pu)(const bsp_encoder_t *p_object,
                                                bsp_encoder_angle_enum angle,
-                                               float *p_value);
+                                               bsp_encoder_pu_angle_t *p_value);
     /** @brief 差分计算机械转速（见 bsp_encoder_get_velocity）。 */
     bsp_encoder_status_enum (*pf_get_velocity)(bsp_encoder_t *p_object);
 } bsp_encoder_mt6701_ops_t;

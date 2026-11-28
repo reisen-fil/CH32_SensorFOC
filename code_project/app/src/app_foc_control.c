@@ -432,7 +432,7 @@ static const svc_fsm_config_t s_app_foc_control_align_fsm_config = {
 };
 
 /**
- * @brief 初始化应用 FOC 控制对象：注入配置、预计算强拖相位步进并初始化服务层。
+ * @brief 初始化应用 FOC 控制对象：注入配置并预计算强拖相位步进。
  * @param p_object 应用 FOC 控制对象指针。
  * @retval app_foc_control_ok 操作成功。
  * @retval app_foc_control_err_param 参数无效或配置非法。
@@ -440,8 +440,6 @@ static const svc_fsm_config_t s_app_foc_control_align_fsm_config = {
  */
 app_foc_control_status_enum app_foc_control_init(app_foc_control_t *p_object)
 {
-    app_foc_control_status_enum status;
-
     if (!app_foc_control_is_object_valid(p_object)) {
         return app_foc_control_err_param;
     }
@@ -464,16 +462,9 @@ app_foc_control_status_enum app_foc_control_init(app_foc_control_t *p_object)
     p_object->encoder_resolution =
         (uint16_t)(1U << p_object->config.encoder_resolution_bits);
 
-    /* 服务层初始化：注入运算配置、PWM 满量程与母线电压，不碰硬件。 */
-    status = app_foc_control_map_status(svc_foc_ops->pf_init(&svc_foc_motor));
-    if (status != app_foc_control_ok) {
-        p_object->state = app_foc_control_state_error;
-        return status;
-    }
-
-    if (svc_foc_motor.config.arithmetic_type != svc_foc_arithmetic_q15) {
-        return app_foc_control_err_unsupported;
-    }
+#if defined(FOC_USE_FLOAT)
+    return app_foc_control_err_unsupported;
+#endif
 
     p_object->config.open_loop_adc_irq_count = (uint16_t)(
         HAL_TIM_PWM_FREQUENCY_HZ / p_object->config.open_loop_frequency_hz);

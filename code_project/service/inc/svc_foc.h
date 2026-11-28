@@ -19,9 +19,9 @@
  *          - PWM 占空比：**计数**（0 ~ config.pwm_period），直接交给 bsp_motor_ctrl，
  *            中间不再经过百分比/标幺量。
  *
- *          运算类型（config.arithmetic_type）：
- *          - q15：全程 Q15 定点（PLAT_IQ_* / PLAT_IQ_SIN_PU / PLAT_IQ_COS_PU），无浮点累加；
- *          - float：全程单精度浮点，三角运算用标准库 sinf / cosf（链接需 -lm）。
+ *          运算类型由 CMake 的 FOC_ARITHMETIC 选项通过 FOC_USE_Q15 / FOC_USE_FLOAT 固定：
+ *          - Q15：全程 Q15 定点（PLAT_IQ_* / PLAT_IQ_SIN_PU / PLAT_IQ_COS_PU）；
+ *          - FLOAT：全程单精度浮点，三角运算用标准库 sinf / cosf（链接需 -lm）。
  *          本模块不做任何 BSP 外设初始化，外设初始化由 app_system 集中调用。
  */
 #ifndef __SVC_FOC_H__
@@ -61,30 +61,19 @@ typedef enum {
 } svc_foc_status_enum;
 
 /**
- * @brief FOC 运算类型。
- * @details 决定并集字段按哪一侧解释，以及三角运算走哪条路径：
- *          - q15：全程 Q15 定点（PLAT_IQ_* / PLAT_IQ_SIN_PU / PLAT_IQ_COS_PU）；
- *          - float：全程单精度浮点，三角运算走标准库 sinf / cosf。
- */
-typedef enum {
-    svc_foc_arithmetic_q15 = 0,  /**< Q15 定点运算 */
-    svc_foc_arithmetic_float     /**< 单精度浮点运算 */
-} svc_foc_arithmetic_enum;
-
-/**
  * @brief SVPWM 计算方式。
  * @details 两者输出的线电压一致，区别只在实现路径：
  *          - sector：先由 αβ 判断扇区，再算 T1/T2 与三相切换点；
- *          - third_harmonic：由 αβ 求三相正弦，叠加 -(max+min)/2 的零序分量。
+ *          - zero_sequence：由 αβ 求三相参考量，叠加 -(max+min)/2 的零序分量。
  */
 typedef enum {
     svc_foc_modulation_svpwm_sector = 0,      /**< 扇区法 */
-    svc_foc_modulation_svpwm_third_harmonic   /**< 三次谐波注入法（min-max 零序注入） */
+    svc_foc_modulation_svpwm_zero_sequence   /**< 零序分量注入 SPWM（min-max 注入） */
 } svc_foc_modulation_enum;
 
 /**
- * @brief 标幺值：同一存储按 config.arithmetic_type 解释为 Q15 或 float。
- * @note 有效成员由运算类型决定；写反了不会报错，只会得到错误的数值。
+ * @brief 标幺值：同一存储按 FOC 构建模式解释为 Q15 或 float。
+ * @note 仅 FOC_USE_Q15 / FOC_USE_FLOAT 对应的成员有效。
  */
 typedef union {
     PLAT_IQ_TYPE q_value;   /**< Q15 定点值（1.0 = 32768） */
@@ -119,20 +108,18 @@ typedef struct {
     uint16_t duty_u;   /**< U 相比较值（计数，0 ~ pwm_period） */
     uint16_t duty_v;   /**< V 相比较值（计数，0 ~ pwm_period） */
     uint16_t duty_w;   /**< W 相比较值（计数，0 ~ pwm_period） */
-    uint8_t sector;    /**< 扇区号 1 ~ 6；三次谐波注入法固定为 0 */
+    uint8_t sector;    /**< 扇区号 1 ~ 6；零序分量注入 SPWM 固定为 0 */
 } svc_foc_pwm_t;
 
 /**
  * @brief FOC 服务层配置表（由本文件内的板级常量 s_svc_foc_config 提供）。
- * @details - arithmetic_type：运算类型（本板取 Q15 定点）；
- *          - modulation：SVPWM 计算方式（本板取扇区法）；
+ * @details - modulation：SVPWM 计算方式（本板取零序分量注入 SPWM）；
  *          - pwm_period：PWM 满量程计数（= HAL_TIM_PWM_PERIOD，与 bsp_motor_ctrl 一致），
  *            标幺占空比按它换算成比较值；
  *          - dc_bus_voltage_v：母线电压基值（V），保留为配置和 Q15 缓存供服务层使用。
  */
 typedef struct {
-    svc_foc_arithmetic_enum arithmetic_type;   /**< 运算类型：Q15 / 浮点 */
-    svc_foc_modulation_enum modulation;        /**< SVPWM 计算方式：扇区法 / 三次谐波 */
+    svc_foc_modulation_enum modulation;        /**< PWM 调制方式：扇区法 / 零序分量注入 SPWM */
 
     uint16_t pwm_period;                       /**< PWM 满量程计数（与 BSP 三相 PWM 一致） */
     float dc_bus_voltage_v;                    /**< 母线电压基值（V） */
@@ -145,7 +132,7 @@ typedef struct {
  * @details 不保存下层对象指针——电流采样与三相 PWM 板级单例
  *          （bsp_current_sense_three_phase / bsp_motor_ctrl_three_phase）由本文件直接引用。
  *          观测字段（current_* / voltage_* / pwm_output）每次调用相应接口后刷新，便于调试
- *          与上层上报；并集值的有效成员由 config.arithmetic_type 决定。
+ *          与上层上报；并集值的有效成员由 FOC_USE_Q15 / FOC_USE_FLOAT 决定。
  */
 typedef struct {
     svc_foc_state_enum state;    /**< 服务层状态 */
@@ -187,11 +174,11 @@ svc_foc_state_enum svc_foc_get_state(const svc_foc_t *p_object);
  * @details 计算链路：
  *          1) 由 dq 标幺电压做逆 Park 得 αβ 标幺电压；
  *          2) SVPWM 直接使用 αβ 标幺值计算三相占空比，不再重复除以母线电压；
- *             （扇区法或三次谐波注入法，均限幅到 [0, 1]）；
+ *             （扇区法或零序分量注入 SPWM，均限幅到 [0, 1]）；
  *          3) 占空比 × pwm_period 得比较值计数，经 bsp_motor_ctrl_ops->pf_set_duty() 下发。
  *          中间结果（voltage_dq / voltage_alpha_beta / pwm_output）同步存进对象便于观测。
- *          入参用 svc_foc_value_t，兼容定点与浮点：调用方按 config.arithmetic_type 填
- *          对应成员（Q15 填 q_value，单位 1.0 = 1 V；浮点填 float_value，单位 V）。
+ *          入参用 svc_foc_value_t，调用方必须按构建宏填写对应成员（Q15 使用 q_value，
+ *          FLOAT 使用 float_value）；本服务层接口中的电压均为标幺值。
  * @param p_object FOC 服务对象指针。
  * @param d_axis_v d 轴电压（V，按运算类型取并集对应成员）。
  * @param q_axis_v q 轴电压（V，按运算类型取并集对应成员）。

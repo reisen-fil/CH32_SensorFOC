@@ -3,8 +3,7 @@
  * @brief 三相电流采样 BSP 实现（双电阻重构：ADC2 注入组 + OPA1/OPA2 内部运放）。
  * @details 相序相关数据统一按 bsp_current_sense_phase_enum 数组访问。calc() 只完成：
  *          ADC 读取 → 偏置扣除 → 基于 ADC 满量程的电流标幺化 → W 相重构；实际电流
- *          （mA）在 get_current() 中按满量程电流换算。Q 路径保存 Q1.15（-32768~32767），
- *          浮点路径保存 -1.0~1.0 的标幺小数值。
+ *          （mA）在 get_current() 中按满量程电流换算。FOC 构建宏选择 Q1.15 或浮点路径.
  */
 
 /*
@@ -20,6 +19,12 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+
+#if defined(FOC_USE_Q15) && defined(FOC_USE_FLOAT)
+#error "Select only one FOC arithmetic implementation"
+#elif !defined(FOC_USE_Q15) && !defined(FOC_USE_FLOAT)
+#error "Define FOC_USE_Q15 or FOC_USE_FLOAT in the CMake configuration"
+#endif
 
 #define BSP_CURRENT_SENSE_SHUNT_MICRO_OHM     (1000U)
 #define BSP_CURRENT_SENSE_GAIN_MILLI          (7333U)
@@ -44,7 +49,6 @@
 #define BSP_CURRENT_SENSE_VALID_PHASE_W       (0x04U)
 
 static const bsp_current_sense_config_t s_current_sense_config = {
-    .data_type = bsp_current_sense_data_type_q,
     .reconstruct = bsp_current_sense_reconstruct_dual_resistor,
     .shunt_resistance_micro_ohm = BSP_CURRENT_SENSE_SHUNT_MICRO_OHM,
     .amplifier_gain_milli = BSP_CURRENT_SENSE_GAIN_MILLI,
@@ -169,8 +173,7 @@ static bsp_current_sense_status_enum bsp_current_sense_read_raw(
 
 /**
  * @brief 按相序统一获取标幺值。
- * @details 合并原 phase_q_ptr 与 phase_a_ptr：根据 data_type 从对应数组复制到同一个
- *          联合体输出，不返回临时地址。
+ * @details 按 FOC 构建模式读取对应数组成员，不返回临时地址.
  */
 static bsp_current_sense_status_enum bsp_current_sense_get_pu_value(
     const bsp_current_sense_t *p_object,
@@ -182,14 +185,11 @@ static bsp_current_sense_status_enum bsp_current_sense_get_pu_value(
         return bsp_current_sense_err_param;
     }
 
-    if (p_object->config.data_type == bsp_current_sense_data_type_q) {
-        p_value->q_value = p_object->current_q[phase];
-    } else if (p_object->config.data_type == bsp_current_sense_data_type_float) {
-        p_value->float_value = p_object->current_a[phase];
-    } else {
-        return bsp_current_sense_err_state;
-    }
-
+#if defined(FOC_USE_Q15)
+    p_value->q_value = p_object->current_q[phase];
+#else
+    p_value->float_value = p_object->current_a[phase];
+#endif
     return bsp_current_sense_ok;
 }
 
@@ -202,28 +202,25 @@ static bsp_current_sense_status_enum bsp_current_sense_get_pu_value(
  * @param adc_full_scale ADC 满量程计数。
  * @return Q1.15 标幺值。
  */
+#if defined(FOC_USE_Q15)
 static PLAT_IQ_TYPE bsp_current_sense_pu_to_q15(int32_t delta,
                                                   uint16_t adc_full_scale)
 {
-    PLAT_IQ_TYPE pu_q;
+    PLAT_IQ_TYPE pu_q = PLAT_IQ_DIV((PLAT_IQ_TYPE)delta,
+                                    (PLAT_IQ_TYPE)adc_full_scale);
     PLAT_IQ_TYPE q_max = (PLAT_IQ_TYPE)(PLAT_IQ(1.0f) - 1);
     PLAT_IQ_TYPE q_min = PLAT_IQ(-1.0f);
-
-    /* Q 格式：delta 与满量程均作为 Q 格式整数，使用平台除法宏得到 delta/full_scale。 */
-    pu_q = PLAT_IQ_DIV((PLAT_IQ_TYPE)delta,
-                       (PLAT_IQ_TYPE)adc_full_scale);
 
     if (pu_q > q_max) {
         pu_q = q_max;
     } else if (pu_q < q_min) {
         pu_q = q_min;
     }
-
     return pu_q;
 }
-
+#else
 /**
- * @brief 把 ADC 计数差转换为浮点电流标幺值。
+ * @brief 把 ADC 计数差转换为浮点电流标幺值.
  * @details 浮点路径只保存 ADC 基准对应的无量纲小数值，实际 mA 换算延迟到
  *          bsp_current_sense_get_current()，避免采样计算函数承担物理单位换算。
  * @param delta 去偏置后的 ADC 计数差，可为正或负。
@@ -235,9 +232,10 @@ static float bsp_current_sense_pu_to_float(int32_t delta, uint16_t adc_full_scal
     /* 浮点路径只保留 ADC 基准对应的标幺小数值，不计算实际电流。 */
     return (float)delta / (float)adc_full_scale;
 }
+#endif
 
 /**
- * @brief 计算指定导通占空比对应的 PWM 低电平计数。
+ * @brief 计算指定导通占空比对应的 PWM 低电平计数.
  * @details bsp_motor_ctrl 保存的是导通占空比，PWM1/PWM2 的比较值极性不同：
  *          PWM1 的低电平计数为 duty，PWM2 的低电平计数为 period - duty。
  *          中心对齐模式下，比较值和 period 使用同一计数单位，故此处直接比较。
@@ -380,11 +378,6 @@ bsp_current_sense_status_enum bsp_current_sense_calc(bsp_current_sense_t *p_obje
     if (p_object->state == bsp_current_sense_state_reset) {
         return bsp_current_sense_err_state;
     }
-    if (p_object->config.data_type != bsp_current_sense_data_type_q &&
-        p_object->config.data_type != bsp_current_sense_data_type_float) {
-        p_object->state = bsp_current_sense_state_error;
-        return bsp_current_sense_err_param;
-    }
     if (bsp_current_sense_read_raw(p_object, &raw_u, &raw_v) != bsp_current_sense_ok) {
         p_object->state = bsp_current_sense_state_error;
         return bsp_current_sense_err_state;
@@ -407,30 +400,25 @@ bsp_current_sense_status_enum bsp_current_sense_calc(bsp_current_sense_t *p_obje
     delta[bsp_current_sense_phase_w] =
         -(delta[bsp_current_sense_phase_u] + delta[bsp_current_sense_phase_v]);
 
-    if (p_object->config.data_type == bsp_current_sense_data_type_q) {
-        for (phase = 0U; phase < (uint8_t)bsp_current_sense_phase_count; phase++) {
-            if ((valid_phase_mask & (uint8_t)(1U << phase)) != 0U) {
-                /* 低电平窗口满足要求，保留当前相的 Q1.15 标幺电流。 */
-                p_object->current_q[phase] =
-                    (PLAT_IQ_TYPE)bsp_current_sense_pu_to_q15(
-                        delta[phase], p_object->config.adc_full_scale);
-            } else {
-                /* 窗口不足时当前 ADC 结果可能处于开关瞬态，直接置零。 */
-                p_object->current_q[phase] = 0;
-            }
-        }
-    } else {
-        for (phase = 0U; phase < (uint8_t)bsp_current_sense_phase_count; phase++) {
-            if ((valid_phase_mask & (uint8_t)(1U << phase)) != 0U) {
-                /* 低电平窗口满足要求，保留当前相的浮点标幺电流。 */
-                p_object->current_a[phase] =
-                    bsp_current_sense_pu_to_float(delta[phase], p_object->config.adc_full_scale);
-            } else {
-                /* 窗口不足时当前 ADC 结果可能处于开关瞬态，直接置零。 */
-                p_object->current_a[phase] = 0.0f;
-            }
+#if defined(FOC_USE_Q15)
+    for (phase = 0U; phase < (uint8_t)bsp_current_sense_phase_count; phase++) {
+        if ((valid_phase_mask & (uint8_t)(1U << phase)) != 0U) {
+            p_object->current_q[phase] = bsp_current_sense_pu_to_q15(
+                delta[phase], p_object->config.adc_full_scale);
+        } else {
+            p_object->current_q[phase] = 0;
         }
     }
+#else
+    for (phase = 0U; phase < (uint8_t)bsp_current_sense_phase_count; phase++) {
+        if ((valid_phase_mask & (uint8_t)(1U << phase)) != 0U) {
+            p_object->current_a[phase] = bsp_current_sense_pu_to_float(
+                delta[phase], p_object->config.adc_full_scale);
+        } else {
+            p_object->current_a[phase] = 0.0f;
+        }
+    }
+#endif
 
     p_object->state = bsp_current_sense_state_running;
     return bsp_current_sense_ok;
@@ -498,16 +486,14 @@ bsp_current_sense_status_enum bsp_current_sense_get_current(
         return status;
     }
 
-    if (p_object->config.data_type == bsp_current_sense_data_type_q) {
-        /* Q1.15 标幺值 × mA 满量程，直接由平台宏取整数部分。 */
-        *p_current_ma = PLAT_IQ_MPY_I32_INT(
-            p_pu->q_value,
-            (int32_t)p_object->full_scale_current_ma);
-    } else {
-        /* 浮点标幺值 × mA 满量程，转换为整数即完成取整。 */
-        *p_current_ma = (int32_t)(p_pu->float_value *
-                                  (float)p_object->full_scale_current_ma);
-    }
+#if defined(FOC_USE_Q15)
+    *p_current_ma = PLAT_IQ_MPY_I32_INT(
+        p_pu->q_value,
+        (int32_t)p_object->full_scale_current_ma);
+#else
+    *p_current_ma = (int32_t)(p_pu->float_value *
+                              (float)p_object->full_scale_current_ma);
+#endif
 
     return bsp_current_sense_ok;
 }

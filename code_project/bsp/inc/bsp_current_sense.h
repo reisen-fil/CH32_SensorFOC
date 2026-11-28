@@ -47,16 +47,6 @@ typedef enum {
 } bsp_current_sense_phase_enum;
 
 /**
- * @brief 电流计算数据类型。
- * @details calc() 输出的是相电流标幺值：Q 路径保存 Q1.15，浮点路径保存 -1.0 ~ 1.0 的
- *          浮点值。两条路径的物理量都是“相对 ADC 满量程”的无量纲值，不是安培值。
- */
-typedef enum {
-    bsp_current_sense_data_type_q = 0, /**< Q1.15 标幺值，范围 -32768 ~ 32767 */
-    bsp_current_sense_data_type_float  /**< 浮点标幺值，范围约 -1.0 ~ 1.0 */
-} bsp_current_sense_data_type_enum;
-
-/**
  * @brief 电流重构方式（采样电阻拓扑）。
  * @note 本板为双电阻：U/V 两相直接采样，W 相由 iu + iv + iw = 0 重构。
  */
@@ -68,8 +58,7 @@ typedef enum {
 
 /**
  * @brief 同时兼容 Q1.15 与浮点标幺值的输出联合体。
- * @details 调用方按 config.data_type 读取对应成员：Q 路径读取 q_value，浮点路径读取
- *          float_value；另一个成员没有定义意义。
+ * @details 有效成员由 FOC_USE_Q15 / FOC_USE_FLOAT 构建宏决定；另一个成员没有定义意义。
  */
 typedef union {
     PLAT_IQ_TYPE q_value; /**< Q1.15 标幺值 */
@@ -82,7 +71,6 @@ typedef union {
  *          注入序号，置 0 即可。
  */
 typedef struct {
-    bsp_current_sense_data_type_enum data_type;
     bsp_current_sense_reconstruct_enum reconstruct;
 
     uint32_t shunt_resistance_micro_ohm;

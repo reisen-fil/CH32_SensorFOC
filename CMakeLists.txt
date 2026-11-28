@@ -26,6 +26,7 @@ include(./cmake/toolchain.cmake)
 project(${PROJ} C CXX ASM)
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_C_STANDARD 99)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # 编译参数 一般不用改
 add_compile_options(
@@ -46,8 +47,21 @@ add_compile_options(
   -fno-omit-frame-pointer
 )
 
+# 构建期选择 FOC 算术实现；应用层控制参数目前仍按 Q15 编码。
+set(FOC_ARITHMETIC "Q15" CACHE STRING "FOC arithmetic implementation (Q15 or FLOAT)")   # FOC_ARITHMETIC默认为Q15
+set_property(CACHE FOC_ARITHMETIC PROPERTY STRINGS Q15 FLOAT)
+string(TOUPPER "${FOC_ARITHMETIC}" FOC_ARITHMETIC_NORMALIZED)
+if(FOC_ARITHMETIC_NORMALIZED STREQUAL "Q15")
+  set(FOC_COMPILE_DEFINITION FOC_USE_Q15=1)
+elseif(FOC_ARITHMETIC_NORMALIZED STREQUAL "FLOAT")
+  set(FOC_COMPILE_DEFINITION FOC_USE_FLOAT=1)
+  message(WARNING "FOC service builds with float; app_foc_control remains Q15-oriented")
+else()
+  message(FATAL_ERROR "FOC_ARITHMETIC must be Q15 or FLOAT; got '${FOC_ARITHMETIC}'")
+endif()
+
 # 编译等级
-add_compile_options(-O0)
+add_compile_options(-Os)
 
 # 编译信息等级
 add_compile_options(-Wall)
@@ -80,6 +94,22 @@ set(CMAKE_BUILD_TYPE Debug)   #禁止编译器调试优化,添加-g选项
 # 故在此统一指定：platform_ch32v203.h 里的 PLAT_IQ_* 封装即按此格式解释）
 add_definitions(-DGLOBAL_Q=15)
 
+# 选择添加部分sdk外设驱动部分.c文件
+set(CH32_STD_PERIPH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/code_project/third_party/wch/ch32v20x/stdperiph/src")
+set(CH32_STD_PERIPH_SOURCES
+  "${CH32_STD_PERIPH_DIR}/ch32v20x_adc.c"
+  "${CH32_STD_PERIPH_DIR}/ch32v20x_dma.c"
+  "${CH32_STD_PERIPH_DIR}/ch32v20x_gpio.c"
+  "${CH32_STD_PERIPH_DIR}/ch32v20x_opa.c"
+  "${CH32_STD_PERIPH_DIR}/ch32v20x_rcc.c"
+  "${CH32_STD_PERIPH_DIR}/ch32v20x_tim.c"
+  "${CH32_STD_PERIPH_DIR}/ch32v20x_spi.c"    
+  "${CH32_STD_PERIPH_DIR}/ch32v20x_usart.c"
+  "${CH32_STD_PERIPH_DIR}/ch32v20x_it.c"
+  "${CH32_STD_PERIPH_DIR}/ch32v20x_misc.c"
+  "${CH32_STD_PERIPH_DIR}/ch32v20x_flash.c"  
+)
+
 # 源码文件
 file(GLOB_RECURSE SOURCES 
 
@@ -87,7 +117,7 @@ file(GLOB_RECURSE SOURCES
   "code_project/third_party/wch/ch32v20x/core/*.c"
   "code_project/third_party/wch/ch32v20x/system/*.c"
   "code_project/third_party/wch/ch32v20x/startup/*.S"
-  "code_project/third_party/wch/ch32v20x/stdperiph/src/*.c"
+  # "code_project/third_party/wch/ch32v20x/stdperiph/src/*.c"
   "code_project/third_party/wch/ch32v20x/iqmath/*.a"
 
   # platform
@@ -102,6 +132,9 @@ file(GLOB_RECURSE SOURCES
   "code_project/app/src/*.c"
 
 )
+# platform
+list(APPEND SOURCES ${CH32_STD_PERIPH_SOURCES})
+
 
 # file(GLOB_RECURSE CORE_SOURCES 
 

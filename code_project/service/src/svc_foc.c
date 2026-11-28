@@ -6,8 +6,7 @@
  *                  --×pwm_period--> 比较值计数 --> bsp_motor_ctrl_ops->pf_set_duty()
  *            三相电流(标幺) --Clarke--> αβ(标幺) --Park--> dq(标幺)（观测用）
  *          Clarke/Park/SVPWM/三角运算全部是本文件内的 static 函数，不对外暴露。
- *          运算类型由 config.arithmetic_type 分派：Q15 定点路径全程 PLAT_IQ_*（三角运算用
- *          PLAT_IQ_SIN_PU / PLAT_IQ_COS_PU），浮点路径走单精度运算与 sinf / cosf。
+ *          运算类型由 FOC_USE_Q15 / FOC_USE_FLOAT 构建宏固定，分别编译对应的定点或单精度实现。
  *          本文件不做任何 BSP 外设初始化，只在运行时经 BSP 函数表访问电流采样与三相 PWM。
  */
 #include "svc_foc.h"
@@ -19,14 +18,20 @@
 #include <string.h>
 #include <math.h>
 
-/** @brief √3 相关的标幺域常量（编译期换算成 Q15 常量，不产生运行期浮点运算）。 */
-#define SVC_FOC_SQRT3              (1.7320508f)
-#define SVC_FOC_HALF_SQRT3         (0.8660254f)
-#define SVC_FOC_ONE_POINT_FIVE     (1.5f)
-#define SVC_FOC_INV_SQRT3          (0.5773503f)
+#if defined(FOC_USE_Q15) && defined(FOC_USE_FLOAT)
+#error "Select only one FOC arithmetic implementation"
+#elif !defined(FOC_USE_Q15) && !defined(FOC_USE_FLOAT)
+#error "Define FOC_USE_Q15 or FOC_USE_FLOAT in the CMake configuration"
+#endif
 
-/** @brief 2π：浮点路径把标幺电角度换算成弧度。 */
+/** @brief √3 相关的标幺域常量。 */
+#define SVC_FOC_HALF_SQRT3         (0.8660254f)
+#define SVC_FOC_INV_SQRT3          (0.5773503f)
+#define SVC_FOC_SQRT3              (1.7320508f)
+#define SVC_FOC_ONE_POINT_FIVE     (1.5f)
+#if defined(FOC_USE_FLOAT)
 #define SVC_FOC_TWO_PI             (6.2831853f)
+#endif
 
 /**
  * @brief FOC 服务层板级配置（Q15 定点 + 扇区法）。
@@ -34,8 +39,7 @@
  *          作为母线电压 Q15 缓存保留。SVPWM 输入已是标幺电压，不再重复归一化。
  */
 static const svc_foc_config_t s_svc_foc_config = {
-    .arithmetic_type = svc_foc_arithmetic_q15,
-    .modulation = svc_foc_modulation_svpwm_third_harmonic,
+    .modulation = svc_foc_modulation_svpwm_zero_sequence,
     .pwm_period = (uint16_t)HAL_TIM_PWM_PERIOD,
     .dc_bus_voltage_v = SVC_FOC_BASE_VOLTAGE_V,
     .p_user_data = NULL
@@ -53,7 +57,7 @@ typedef struct {
     svc_foc_value_t duty_u;   /**< U 相标幺占空比 */
     svc_foc_value_t duty_v;   /**< V 相标幺占空比 */
     svc_foc_value_t duty_w;   /**< W 相标幺占空比 */
-    uint8_t sector;           /**< 扇区号 1 ~ 6；三次谐波注入法固定为 0 */
+    uint8_t sector;           /**< 扇区号 1 ~ 6；零序注入法固定为 0 */
 } svc_foc_duty_pu_t;
 
 /**
@@ -77,17 +81,13 @@ static svc_foc_status_enum svc_foc_validate(const svc_foc_t *p_object)
  * @param p_object FOC 服务对象指针。
  * @return true 表示并集值取 q_value 成员。
  */
-static bool svc_foc_is_q15(const svc_foc_t *p_object)
-{
-    return (p_object->config.arithmetic_type == svc_foc_arithmetic_q15);
-}
-
 /**
  * @brief 把 Q15 占空比限幅到 [0, 1]。
  * @param value Q15 占空比。
  * @return 限幅后的值。
  */
-static PLAT_IQ_TYPE svc_foc_clamp_q15(PLAT_IQ_TYPE value)
+#if defined(FOC_USE_Q15)
+static PLAT_IQ_TYPE svc_foc_clamp(PLAT_IQ_TYPE value)
 {
     if (value < 0) {
         return 0;
@@ -97,13 +97,8 @@ static PLAT_IQ_TYPE svc_foc_clamp_q15(PLAT_IQ_TYPE value)
     }
     return value;
 }
-
-/**
- * @brief 把浮点占空比限幅到 [0, 1]。
- * @param value 浮点占空比。
- * @return 限幅后的值。
- */
-static float svc_foc_clamp_float(float value)
+#else
+static float svc_foc_clamp(float value)
 {
     if (value < 0.0f) {
         return 0.0f;
@@ -113,6 +108,7 @@ static float svc_foc_clamp_float(float value)
     }
     return value;
 }
+#endif
 
 /**
  * @brief 求标幺电角度的正弦/余弦（按运算类型分派）。
@@ -121,21 +117,18 @@ static float svc_foc_clamp_float(float value)
  * @param p_sin 输出正弦值。
  * @param p_cos 输出余弦值。
  */
-static void svc_foc_sin_cos_calc(const svc_foc_t *p_object,
-                                 svc_foc_value_t angle_pu,
+static void svc_foc_sin_cos_calc(svc_foc_value_t angle_pu,
                                  svc_foc_value_t *p_sin,
                                  svc_foc_value_t *p_cos)
 {
-    if (svc_foc_is_q15(p_object)) {
-        /* Q15：直接用标幺输入（1.0 = 2π）的查表函数 */
-        p_sin->q_value = PLAT_IQ_SIN_PU(angle_pu.q_value);
-        p_cos->q_value = PLAT_IQ_COS_PU(angle_pu.q_value);
-    } else {
-        float radian = SVC_FOC_TWO_PI * angle_pu.float_value;
-
-        p_sin->float_value = sinf(radian);
-        p_cos->float_value = cosf(radian);
-    }
+#if defined(FOC_USE_Q15)
+    p_sin->q_value = PLAT_IQ_SIN_PU(angle_pu.q_value);
+    p_cos->q_value = PLAT_IQ_COS_PU(angle_pu.q_value);
+#else
+    float radian = SVC_FOC_TWO_PI * angle_pu.float_value;
+    p_sin->float_value = sinf(radian);
+    p_cos->float_value = cosf(radian);
+#endif
 }
 
 /**
@@ -148,18 +141,18 @@ static void svc_foc_clarke_calc(const svc_foc_t *p_object,
                                 const svc_foc_abc_t *p_abc,
                                 svc_foc_alpha_beta_t *p_alpha_beta)
 {
-    if (svc_foc_is_q15(p_object)) {
-        PLAT_IQ_TYPE sum = PLAT_IQ_TO_IQ((int32_t)p_abc->phase_u.q_value
-                                         + (2 * (int32_t)p_abc->phase_v.q_value));
-
-        p_alpha_beta->alpha.q_value = p_abc->phase_u.q_value;
-        p_alpha_beta->beta.q_value = PLAT_IQ_MPY(sum, PLAT_IQ(SVC_FOC_INV_SQRT3));
-    } else {
-        p_alpha_beta->alpha.float_value = p_abc->phase_u.float_value;
-        p_alpha_beta->beta.float_value =
-            (p_abc->phase_u.float_value + (2.0f * p_abc->phase_v.float_value)) *
-            SVC_FOC_INV_SQRT3;
-    }
+    (void)p_object;
+#if defined(FOC_USE_Q15)
+    PLAT_IQ_TYPE sum = PLAT_IQ_TO_IQ((int32_t)p_abc->phase_u.q_value
+                                     + (2 * (int32_t)p_abc->phase_v.q_value));
+    p_alpha_beta->alpha.q_value = p_abc->phase_u.q_value;
+    p_alpha_beta->beta.q_value = PLAT_IQ_MPY(sum, PLAT_IQ(SVC_FOC_INV_SQRT3));
+#else
+    p_alpha_beta->alpha.float_value = p_abc->phase_u.float_value;
+    p_alpha_beta->beta.float_value =
+        (p_abc->phase_u.float_value + (2.0f * p_abc->phase_v.float_value)) *
+        SVC_FOC_INV_SQRT3;
+#endif
 }
 
 /**
@@ -173,22 +166,21 @@ static void svc_foc_inverse_clarke_calc(const svc_foc_t *p_object,
                                         const svc_foc_alpha_beta_t *p_alpha_beta,
                                         svc_foc_abc_t *p_abc)
 {
-    if (svc_foc_is_q15(p_object)) {
-        PLAT_IQ_TYPE half_alpha = PLAT_IQ_MPY(PLAT_IQ(0.5f), p_alpha_beta->alpha.q_value);
-        PLAT_IQ_TYPE half_sqrt3_beta =
-            PLAT_IQ_MPY(PLAT_IQ(SVC_FOC_HALF_SQRT3), p_alpha_beta->beta.q_value);
-
-        p_abc->phase_u.q_value = p_alpha_beta->alpha.q_value;
-        p_abc->phase_v.q_value = half_sqrt3_beta - half_alpha;
-        p_abc->phase_w.q_value = -half_sqrt3_beta - half_alpha;
-    } else {
-        float half_alpha = 0.5f * p_alpha_beta->alpha.float_value;
-        float half_sqrt3_beta = SVC_FOC_HALF_SQRT3 * p_alpha_beta->beta.float_value;
-
-        p_abc->phase_u.float_value = p_alpha_beta->alpha.float_value;
-        p_abc->phase_v.float_value = half_sqrt3_beta - half_alpha;
-        p_abc->phase_w.float_value = -half_sqrt3_beta - half_alpha;
-    }
+    (void)p_object;
+#if defined(FOC_USE_Q15)
+    PLAT_IQ_TYPE half_alpha = PLAT_IQ_MPY(PLAT_IQ(0.5f), p_alpha_beta->alpha.q_value);
+    PLAT_IQ_TYPE half_sqrt3_beta =
+        PLAT_IQ_MPY(PLAT_IQ(SVC_FOC_HALF_SQRT3), p_alpha_beta->beta.q_value);
+    p_abc->phase_u.q_value = p_alpha_beta->alpha.q_value;
+    p_abc->phase_v.q_value = half_sqrt3_beta - half_alpha;
+    p_abc->phase_w.q_value = -half_sqrt3_beta - half_alpha;
+#else
+    float half_alpha = 0.5f * p_alpha_beta->alpha.float_value;
+    float half_sqrt3_beta = SVC_FOC_HALF_SQRT3 * p_alpha_beta->beta.float_value;
+    p_abc->phase_u.float_value = p_alpha_beta->alpha.float_value;
+    p_abc->phase_v.float_value = half_sqrt3_beta - half_alpha;
+    p_abc->phase_w.float_value = -half_sqrt3_beta - half_alpha;
+#endif
 }
 
 /**
@@ -207,19 +199,18 @@ static void svc_foc_park_calc(const svc_foc_t *p_object,
     svc_foc_value_t sin_value;
     svc_foc_value_t cos_value;
 
-    svc_foc_sin_cos_calc(p_object, angle_pu, &sin_value, &cos_value);
-
-    if (svc_foc_is_q15(p_object)) {
-        p_dq->d.q_value = PLAT_IQ_MPY(p_alpha_beta->alpha.q_value, cos_value.q_value)
-                          + PLAT_IQ_MPY(p_alpha_beta->beta.q_value, sin_value.q_value);
-        p_dq->q.q_value = PLAT_IQ_MPY(p_alpha_beta->beta.q_value, cos_value.q_value)
-                          - PLAT_IQ_MPY(p_alpha_beta->alpha.q_value, sin_value.q_value);
-    } else {
-        p_dq->d.float_value = (p_alpha_beta->alpha.float_value * cos_value.float_value)
-                              + (p_alpha_beta->beta.float_value * sin_value.float_value);
-        p_dq->q.float_value = (p_alpha_beta->beta.float_value * cos_value.float_value)
-                              - (p_alpha_beta->alpha.float_value * sin_value.float_value);
-    }
+    svc_foc_sin_cos_calc(angle_pu, &sin_value, &cos_value);
+#if defined(FOC_USE_Q15)
+    p_dq->d.q_value = PLAT_IQ_MPY(p_alpha_beta->alpha.q_value, cos_value.q_value)
+                      + PLAT_IQ_MPY(p_alpha_beta->beta.q_value, sin_value.q_value);
+    p_dq->q.q_value = PLAT_IQ_MPY(p_alpha_beta->beta.q_value, cos_value.q_value)
+                      - PLAT_IQ_MPY(p_alpha_beta->alpha.q_value, sin_value.q_value);
+#else
+    p_dq->d.float_value = (p_alpha_beta->alpha.float_value * cos_value.float_value)
+                          + (p_alpha_beta->beta.float_value * sin_value.float_value);
+    p_dq->q.float_value = (p_alpha_beta->beta.float_value * cos_value.float_value)
+                          - (p_alpha_beta->alpha.float_value * sin_value.float_value);
+#endif
 }
 
 /**
@@ -238,23 +229,23 @@ static void svc_foc_inverse_park_calc(const svc_foc_t *p_object,
     svc_foc_value_t sin_value;
     svc_foc_value_t cos_value;
 
-    svc_foc_sin_cos_calc(p_object, angle_pu, &sin_value, &cos_value);
-
-    if (svc_foc_is_q15(p_object)) {
-        p_alpha_beta->alpha.q_value = PLAT_IQ_MPY(p_dq->d.q_value, cos_value.q_value)
-                                      - PLAT_IQ_MPY(p_dq->q.q_value, sin_value.q_value);
-        p_alpha_beta->beta.q_value = PLAT_IQ_MPY(p_dq->d.q_value, sin_value.q_value)
-                                     + PLAT_IQ_MPY(p_dq->q.q_value, cos_value.q_value);
-    } else {
-        p_alpha_beta->alpha.float_value = (p_dq->d.float_value * cos_value.float_value)
-                                          - (p_dq->q.float_value * sin_value.float_value);
-        p_alpha_beta->beta.float_value = (p_dq->d.float_value * sin_value.float_value)
-                                         + (p_dq->q.float_value * cos_value.float_value);
-    }
+    svc_foc_sin_cos_calc(angle_pu, &sin_value, &cos_value);
+#if defined(FOC_USE_Q15)
+    p_alpha_beta->alpha.q_value = PLAT_IQ_MPY(p_dq->d.q_value, cos_value.q_value)
+                                  - PLAT_IQ_MPY(p_dq->q.q_value, sin_value.q_value);
+    p_alpha_beta->beta.q_value = PLAT_IQ_MPY(p_dq->d.q_value, sin_value.q_value)
+                                 + PLAT_IQ_MPY(p_dq->q.q_value, cos_value.q_value);
+#else
+    p_alpha_beta->alpha.float_value = (p_dq->d.float_value * cos_value.float_value)
+                                      - (p_dq->q.float_value * sin_value.float_value);
+    p_alpha_beta->beta.float_value = (p_dq->d.float_value * sin_value.float_value)
+                                     + (p_dq->q.float_value * cos_value.float_value);
+#endif
 }
 
+#if defined(FOC_USE_Q15)
 /**
- * @brief 扇区法 SVPWM（Q15 定点路径）：标幺 αβ → 标幺占空比。
+ * @brief 扇区法 SVPWM（Q15 定点路径）：标幺 αβ → 标幺占空比.
  * @details 先由 αβ 判扇区（A = β、B = (√3α - β)/2、C = (-√3α - β)/2 的符号位组合成
  *          N = 1 ~ 6），再由 X = √3β、Y = 1.5α + (√3/2)β、Z = -1.5α + (√3/2)β 按扇区
  *          取 T1/T2，最低相切换点 Ta = (1 - T1 - T2)/2，其余两相依次加 T1、T2。
@@ -319,12 +310,12 @@ static void svc_foc_svpwm_sector_q15(const svc_foc_t *p_object,
     default: duty_u = ta; duty_v = ta; duty_w = ta; break;
     }
 
-    p_duty_pu->duty_u.q_value = svc_foc_clamp_q15(duty_u);
-    p_duty_pu->duty_v.q_value = svc_foc_clamp_q15(duty_v);
-    p_duty_pu->duty_w.q_value = svc_foc_clamp_q15(duty_w);
+    p_duty_pu->duty_u.q_value = svc_foc_clamp(duty_u);
+    p_duty_pu->duty_v.q_value = svc_foc_clamp(duty_v);
+    p_duty_pu->duty_w.q_value = svc_foc_clamp(duty_w);
     p_duty_pu->sector = sector;
 }
-
+#else
 /**
  * @brief 扇区法 SVPWM（浮点路径）：算法与 Q15 版本一一对应。
  * @param p_object FOC 服务对象指针。
@@ -382,21 +373,23 @@ static void svc_foc_svpwm_sector_float(const svc_foc_t *p_object,
     default: duty_u = ta; duty_v = ta; duty_w = ta; break;
     }
 
-    p_duty_pu->duty_u.float_value = svc_foc_clamp_float(duty_u);
-    p_duty_pu->duty_v.float_value = svc_foc_clamp_float(duty_v);
-    p_duty_pu->duty_w.float_value = svc_foc_clamp_float(duty_w);
+    p_duty_pu->duty_u.float_value = svc_foc_clamp(duty_u);
+    p_duty_pu->duty_v.float_value = svc_foc_clamp(duty_v);
+    p_duty_pu->duty_w.float_value = svc_foc_clamp(duty_w);
     p_duty_pu->sector = sector;
 }
+#endif
 
+#if defined(FOC_USE_Q15)
 /**
- * @brief 三次谐波注入法 SVPWM（Q15 定点路径）：标幺 αβ → 标幺占空比。
+ * @brief 零序分量注入 SPWM（Q15 定点路径）：标幺 αβ → 标幺占空比.
  * @details 由 αβ 逆 Clarke 求三相正弦，叠加零序分量 -(max+min)/2，再整体抬到以 0.5 为
  *          中心；与扇区法输出的线电压等价。
  * @param p_object FOC 服务对象指针。
  * @param p_alpha_beta_pu 输入 αβ 电压（标幺母线电压）。
  * @param p_duty_pu 输出三相标幺占空比（扇区号固定为 0）。
  */
-static void svc_foc_svpwm_third_harmonic_q15(const svc_foc_t *p_object,
+static void svc_foc_svpwm_zero_sequence_q15(const svc_foc_t *p_object,
                                              const svc_foc_alpha_beta_t *p_alpha_beta_pu,
                                              svc_foc_duty_pu_t *p_duty_pu)
 {
@@ -424,22 +417,22 @@ static void svc_foc_svpwm_third_harmonic_q15(const svc_foc_t *p_object,
 
     offset = -((phase_max + phase_min) / 2);
 
-    p_duty_pu->duty_u.q_value = svc_foc_clamp_q15(PLAT_IQ(0.5f)
+    p_duty_pu->duty_u.q_value = svc_foc_clamp(PLAT_IQ(0.5f)
                                                   + phase.phase_u.q_value + offset);
-    p_duty_pu->duty_v.q_value = svc_foc_clamp_q15(PLAT_IQ(0.5f)
+    p_duty_pu->duty_v.q_value = svc_foc_clamp(PLAT_IQ(0.5f)
                                                   + phase.phase_v.q_value + offset);
-    p_duty_pu->duty_w.q_value = svc_foc_clamp_q15(PLAT_IQ(0.5f)
+    p_duty_pu->duty_w.q_value = svc_foc_clamp(PLAT_IQ(0.5f)
                                                   + phase.phase_w.q_value + offset);
     p_duty_pu->sector = 0U;
 }
-
+#else
 /**
- * @brief 三次谐波注入法 SVPWM（浮点路径）：算法与 Q15 版本一一对应。
+ * @brief 零序分量注入 SPWM（浮点路径）：算法与 Q15 版本一一对应。
  * @param p_object FOC 服务对象指针。
  * @param p_alpha_beta_pu 输入 αβ 电压（标幺母线电压）。
  * @param p_duty_pu 输出三相标幺占空比（扇区号固定为 0）。
  */
-static void svc_foc_svpwm_third_harmonic_float(const svc_foc_t *p_object,
+static void svc_foc_svpwm_zero_sequence_float(const svc_foc_t *p_object,
                                                const svc_foc_alpha_beta_t *p_alpha_beta_pu,
                                                svc_foc_duty_pu_t *p_duty_pu)
 {
@@ -468,16 +461,17 @@ static void svc_foc_svpwm_third_harmonic_float(const svc_foc_t *p_object,
     offset = -((phase_max + phase_min) * 0.5f);
 
     p_duty_pu->duty_u.float_value =
-        svc_foc_clamp_float(0.5f + phase.phase_u.float_value + offset);
+        svc_foc_clamp(0.5f + phase.phase_u.float_value + offset);
     p_duty_pu->duty_v.float_value =
-        svc_foc_clamp_float(0.5f + phase.phase_v.float_value + offset);
+        svc_foc_clamp(0.5f + phase.phase_v.float_value + offset);
     p_duty_pu->duty_w.float_value =
-        svc_foc_clamp_float(0.5f + phase.phase_w.float_value + offset);
+        svc_foc_clamp(0.5f + phase.phase_w.float_value + offset);
     p_duty_pu->sector = 0U;
 }
+#endif
 
 /**
- * @brief SVPWM 计算：αβ 标幺电压 → 三相标幺占空比。
+ * @brief SVPWM 计算：αβ 标幺电压 → 三相标幺占空比.
  * @details 输入 αβ 已按 SVC_FOC_BASE_VOLTAGE_V 归一化，直接分派到具体 SVPWM 实现；
  *          dc_bus_q 保留为服务层母线基值缓存，不在此处再次参与归一化。
  * @param p_object FOC 服务对象指针。
@@ -491,27 +485,22 @@ static svc_foc_status_enum svc_foc_svpwm_calc(const svc_foc_t *p_object,
                                               const svc_foc_alpha_beta_t *p_voltage_pu,
                                               svc_foc_duty_pu_t *p_duty_pu)
 {
-    if ((p_object->config.arithmetic_type != svc_foc_arithmetic_q15) &&
-        (p_object->config.arithmetic_type != svc_foc_arithmetic_float)) {
-        return svc_foc_err_unsupported;
-    }
-
-    /* 输入已经是按电压基值归一化的 αβ 标幺值，直接进入 SVPWM。 */
+    /* 输入已经是按电压基值归一化的 αβ 标幺值，直接进入所选调制算法。 */
     switch (p_object->config.modulation) {
     case svc_foc_modulation_svpwm_sector:
-        if (svc_foc_is_q15(p_object)) {
-            svc_foc_svpwm_sector_q15(p_object, p_voltage_pu, p_duty_pu);
-        } else {
-            svc_foc_svpwm_sector_float(p_object, p_voltage_pu, p_duty_pu);
-        }
+#if defined(FOC_USE_Q15)
+        svc_foc_svpwm_sector_q15(p_object, p_voltage_pu, p_duty_pu);
+#else
+        svc_foc_svpwm_sector_float(p_object, p_voltage_pu, p_duty_pu);
+#endif
         break;
 
-    case svc_foc_modulation_svpwm_third_harmonic:
-        if (svc_foc_is_q15(p_object)) {
-            svc_foc_svpwm_third_harmonic_q15(p_object, p_voltage_pu, p_duty_pu);
-        } else {
-            svc_foc_svpwm_third_harmonic_float(p_object, p_voltage_pu, p_duty_pu);
-        }
+    case svc_foc_modulation_svpwm_zero_sequence:
+#if defined(FOC_USE_Q15)
+        svc_foc_svpwm_zero_sequence_q15(p_object, p_voltage_pu, p_duty_pu);
+#else
+        svc_foc_svpwm_zero_sequence_float(p_object, p_voltage_pu, p_duty_pu);
+#endif
         break;
 
     default:
@@ -531,21 +520,21 @@ static void svc_foc_duty_to_counts(const svc_foc_t *p_object,
                                    const svc_foc_duty_pu_t *p_duty_pu,
                                    svc_foc_pwm_t *p_pwm)
 {
-    if (svc_foc_is_q15(p_object)) {
-        p_pwm->duty_u = (uint16_t)PLAT_IQ_MPY_I32_INT(p_duty_pu->duty_u.q_value,
-                                                     (int32_t)p_object->pwm_period);
-        p_pwm->duty_v = (uint16_t)PLAT_IQ_MPY_I32_INT(p_duty_pu->duty_v.q_value,
-                                                     (int32_t)p_object->pwm_period);
-        p_pwm->duty_w = (uint16_t)PLAT_IQ_MPY_I32_INT(p_duty_pu->duty_w.q_value,
-                                                     (int32_t)p_object->pwm_period);
-    } else {
-        p_pwm->duty_u = (uint16_t)((p_duty_pu->duty_u.float_value
-                                    * (float)p_object->pwm_period) + 0.5f);
-        p_pwm->duty_v = (uint16_t)((p_duty_pu->duty_v.float_value
-                                    * (float)p_object->pwm_period) + 0.5f);
-        p_pwm->duty_w = (uint16_t)((p_duty_pu->duty_w.float_value
-                                    * (float)p_object->pwm_period) + 0.5f);
-    }
+#if defined(FOC_USE_Q15)
+    p_pwm->duty_u = (uint16_t)PLAT_IQ_MPY_I32_INT(p_duty_pu->duty_u.q_value,
+                                                 (int32_t)p_object->pwm_period);
+    p_pwm->duty_v = (uint16_t)PLAT_IQ_MPY_I32_INT(p_duty_pu->duty_v.q_value,
+                                                 (int32_t)p_object->pwm_period);
+    p_pwm->duty_w = (uint16_t)PLAT_IQ_MPY_I32_INT(p_duty_pu->duty_w.q_value,
+                                                 (int32_t)p_object->pwm_period);
+#else
+    p_pwm->duty_u = (uint16_t)((p_duty_pu->duty_u.float_value
+                                * (float)p_object->pwm_period) + 0.5f);
+    p_pwm->duty_v = (uint16_t)((p_duty_pu->duty_v.float_value
+                                * (float)p_object->pwm_period) + 0.5f);
+    p_pwm->duty_w = (uint16_t)((p_duty_pu->duty_w.float_value
+                                * (float)p_object->pwm_period) + 0.5f);
+#endif
 
     p_pwm->sector = p_duty_pu->sector;
 }
@@ -566,12 +555,8 @@ svc_foc_status_enum svc_foc_init(svc_foc_t *p_object)
     (void)memset(p_object, 0, sizeof(*p_object));
     p_object->config = s_svc_foc_config;
 
-    if ((p_object->config.arithmetic_type != svc_foc_arithmetic_q15) &&
-        (p_object->config.arithmetic_type != svc_foc_arithmetic_float)) {
-        return svc_foc_err_unsupported;
-    }
     if ((p_object->config.modulation != svc_foc_modulation_svpwm_sector) &&
-        (p_object->config.modulation != svc_foc_modulation_svpwm_third_harmonic)) {
+        (p_object->config.modulation != svc_foc_modulation_svpwm_zero_sequence)) {
         return svc_foc_err_unsupported;
     }
     if ((p_object->config.pwm_period == 0U) ||
@@ -579,9 +564,12 @@ svc_foc_status_enum svc_foc_init(svc_foc_t *p_object)
         return svc_foc_err_param;
     }
 
-    /* 板级常量缓存：PWM 满量程与母线电压的 Q15 形式 */
     p_object->pwm_period = p_object->config.pwm_period;
+#if defined(FOC_USE_Q15)
     p_object->dc_bus_q = PLAT_IQ(p_object->config.dc_bus_voltage_v);
+#else
+    p_object->dc_bus_q = (PLAT_IQ_TYPE)0;
+#endif
 
     p_object->state = svc_foc_state_ready;
 
@@ -603,8 +591,8 @@ svc_foc_state_enum svc_foc_get_state(const svc_foc_t *p_object)
 
 /**
  * @brief dq 轴标幺电压 → 三相 PWM 输出。
- * @details dq 入参是定点/浮点兼容的并集类型：调用方按 config.arithmetic_type 填好对应
- *          成员（Q15 或浮点均使用标幺值，1.0 pu = SVC_FOC_BASE_VOLTAGE_V），本函数直接透传，
+ * @details dq 入参是定点/浮点兼容的并集类型：调用方按 FOC 构建宏填写对应成员（Q15
+ *          或浮点均使用标幺值，1.0 pu = SVC_FOC_BASE_VOLTAGE_V），本函数直接透传，
  *          不再做单位换算。内部链路：逆 Park(标幺) → SVPWM → 占空比
  *          × pwm_period → 比较值计数 → 经 BSP 下发三相 PWM。
  * @param p_object FOC 服务对象指针。
@@ -704,23 +692,23 @@ svc_foc_status_enum svc_foc_get_current(svc_foc_t *p_object, svc_foc_value_t ang
             }
 
             (void)current_ma;
-            if (svc_foc_is_q15(p_object)) {
-                if (phase == (uint8_t)bsp_current_sense_phase_u) {
-                    current_abc.phase_u.q_value = current_pu.q_value;
-                } else if (phase == (uint8_t)bsp_current_sense_phase_v) {
-                    current_abc.phase_v.q_value = current_pu.q_value;
-                } else {
-                    current_abc.phase_w.q_value = current_pu.q_value;
-                }
+#if defined(FOC_USE_Q15)
+            if (phase == (uint8_t)bsp_current_sense_phase_u) {
+                current_abc.phase_u.q_value = current_pu.q_value;
+            } else if (phase == (uint8_t)bsp_current_sense_phase_v) {
+                current_abc.phase_v.q_value = current_pu.q_value;
             } else {
-                if (phase == (uint8_t)bsp_current_sense_phase_u) {
-                    current_abc.phase_u.float_value = current_pu.float_value;
-                } else if (phase == (uint8_t)bsp_current_sense_phase_v) {
-                    current_abc.phase_v.float_value = current_pu.float_value;
-                } else {
-                    current_abc.phase_w.float_value = current_pu.float_value;
-                }
+                current_abc.phase_w.q_value = current_pu.q_value;
             }
+#else
+            if (phase == (uint8_t)bsp_current_sense_phase_u) {
+                current_abc.phase_u.float_value = current_pu.float_value;
+            } else if (phase == (uint8_t)bsp_current_sense_phase_v) {
+                current_abc.phase_v.float_value = current_pu.float_value;
+            } else {
+                current_abc.phase_w.float_value = current_pu.float_value;
+            }
+#endif
         }
 
         p_object->current_abc = current_abc;

@@ -3,6 +3,7 @@
 set(SUFFIX ".elf")
 
 add_executable(${PROJECT_NAME} ${SOURCES} ${LINKER_SCRIPT})
+target_compile_definitions(${PROJECT_NAME} PRIVATE ${FOC_COMPILE_DEFINITION})
 
 set_target_properties(${PROJECT_NAME} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib_obj"
@@ -10,19 +11,22 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
   LINKER_LANGUAGE C
 )
 
-# 链接静态库
+# 标准库数学函数仅在 float FOC 构建中需要。
 target_link_libraries(
   ${PROJECT_NAME}
   -Wl,--start-group
   gcc
-  m     # 用到了三角函数（svc_foc 浮点路径的 sinf/cosf），链接数学库 libm.a
   c
   -Wl,--whole-archive
   -Wl,--no-whole-archive
   -Wl,--end-group
   # -Wl,-u,_printf_float
-  -Wl,-lIQmath_RV32     # IQmath定点运算浮点
 )
+if(FOC_ARITHMETIC_NORMALIZED STREQUAL "FLOAT")
+  target_link_libraries(${PROJECT_NAME} m)
+elseif(FOC_ARITHMETIC_NORMALIZED STREQUAL "Q15")
+  target_link_libraries(${PROJECT_NAME} -Wl,-lIQmath_RV32)    # IQmath定点运算浮点
+endif()
 
 
 # Build target
